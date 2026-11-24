@@ -14,8 +14,8 @@
 
 ---
 
-[![Website](https://img.shields.io/badge/Showcase-Interactive_Website-FF3B30?style=for-the-badge&logo=googlechrome&logoColor=white)](website/index.html)
-[![Android](https://img.shields.io/badge/Platform-Android_8.0+_(API_26+)-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://developer.android.com/)
+[![Website](https://img.shields.io/badge/Showcase-Interactive_Website-FF3B30?style=for-the-badge&logo=googlechrome&logoColor=white)](https://argonavis.web.app)
+[![Android](https://img.shields.io/badge/Platform-Android_8.0+_(API_26+)-3DDC84?style=for-the-badge&logo=android&logoColor=white)]([https://developer.android.com/](https://github.com/2pro4youx/Argo-Navis/releases/tag/debug-unstable-v1))
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0+-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack_Compose-4285F4?style=for-the-badge&logo=jetpackcompose&logoColor=white)](https://developer.android.com/jetpack/compose)
 [![Security](https://img.shields.io/badge/Auth-HMAC--SHA256_Signed-critical?style=for-the-badge&logo=lock&logoColor=white)](#-cryptographic-tamper-proofing)
