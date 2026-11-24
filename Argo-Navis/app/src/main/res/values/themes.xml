@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.ArgoAlert" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#090B0E</item>
+        <item name="android:statusBarColor">#090B0E</item>
+        <item name="android:navigationBarColor">#090B0E</item>
+    </style>
+
+    <style name="Theme.ArgoAlert.Emergency" parent="android:Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">#7F0000</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+
+    <style name="Theme.MyApplication" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

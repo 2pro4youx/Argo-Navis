@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Argo Alert</string>
+    <string name="device_admin_description">Allows Argo Alert to operate as an OEM emergency override layer with lock task mode.</string>
+    <string name="monitor_channel_name">Emergency Layer Monitor</string>
+    <string name="monitor_channel_description">Persistent background channel for OEM emergency alert polling.</string>
+    <string name="alarm_channel_name">Critical Emergency Override</string>
+    <string name="alarm_channel_description">Full-screen life-safety emergency alert channel.</string>
+</resources>

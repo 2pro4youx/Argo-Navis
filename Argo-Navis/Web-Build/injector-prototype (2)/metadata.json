@@ -1,0 +1,6 @@
+{
+  "name": "Argo Alert",
+  "description": "OEM emergency alert layer Android app (Kotlin & Jetpack Compose, com.argo.alert) with interactive device simulator, protocol verifier, and full source browser.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
