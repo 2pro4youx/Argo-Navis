@@ -176,7 +176,7 @@ app/src/main/java/com/argo/alert/
 ### 1. Clone & Build
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/ArgoNavis.git
+git clone https://github.com/2pro4youx/ArgoNavis.git
 cd ArgoNavis
 
 # Build debug APK via Gradle Wrapper
