@@ -500,26 +500,25 @@ private fun BootstrapScreen(
                 modifier = Modifier.weight(1f),
             )
             CompactActionButton(
-                label = "USB 127.0.0.1",
-                selected = serverUrl == "http://127.0.0.1:8000",
-                activeColor = Color(0xFF2563EB),
+                label = "Firebase (Default)",
+                selected = serverUrl == EventClient.DEFAULT_BASE_URL,
+                activeColor = Color(0xFF065F46),
                 onClick = {
                     urlInput = EventClient.DEFAULT_BASE_URL
                     onSaveServerUrl(EventClient.DEFAULT_BASE_URL)
                 },
                 modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(8.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF065F46)),
-            ) {
-                Text("Firebase (Default)", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
-            }
+            )
         }
         Spacer(modifier = Modifier.height(8.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Button(
+            CompactActionButton(
+                label = "USB 127.0.0.1",
+                selected = serverUrl == "http://127.0.0.1:8000",
+                activeColor = Color(0xFF2563EB),
                 onClick = {
                     urlInput = "http://127.0.0.1:8000"
                     onSaveServerUrl("http://127.0.0.1:8000")
