@@ -8,8 +8,13 @@ data class ActiveAlertState(
     val alert: AlertPayload? = null,
     val reservePowerActive: Boolean = false,
     val userLocation: GeoPoint = GeoPoint(23.2599, 77.4126),
+    val locationSource: String = "none",
     val batteryPct: Int = 100,
     val clearNonce: Long = 0L,
+    val transportMode: TransportMode = TransportMode.DUAL,
+    val firebaseChannel: String = EventClient.DEFAULT_FIREBASE_CHANNEL,
+    val deviceId: String = EventClient.DEFAULT_DEVICE_ID,
+    val firebaseStatus: String = "Connecting...",
     val serverUrl: String = EventClient.DEFAULT_BASE_URL,
     val lastPollStatus: String = "Starting...",
     val mockLocationOverride: GeoPoint? = null,
@@ -35,15 +40,40 @@ object AlertStateHolder {
         )
     }
 
-    fun updateLocation(location: GeoPoint) {
-        _state.value = _state.value.copy(userLocation = location)
+    fun updateLocation(location: GeoPoint, source: String = _state.value.locationSource) {
+        _state.value = _state.value.copy(
+            userLocation = location,
+            locationSource = source,
+        )
     }
 
     fun updateBattery(batteryPct: Int) {
-        _state.value = _state.value.copy(
+        val current = _state.value
+        val nextReserve = if (current.alert != null) {
+            current.reservePowerActive || batteryPct <= 5
+        } else {
+            batteryPct <= 5
+        }
+        _state.value = current.copy(
             batteryPct = batteryPct,
-            reservePowerActive = _state.value.reservePowerActive || batteryPct <= 5,
+            reservePowerActive = nextReserve,
         )
+    }
+
+    fun updateTransportMode(mode: TransportMode) {
+        _state.value = _state.value.copy(transportMode = mode)
+    }
+
+    fun updateFirebaseChannel(channel: String) {
+        _state.value = _state.value.copy(firebaseChannel = channel)
+    }
+
+    fun updateDeviceId(deviceId: String) {
+        _state.value = _state.value.copy(deviceId = deviceId)
+    }
+
+    fun updateFirebaseStatus(status: String) {
+        _state.value = _state.value.copy(firebaseStatus = status)
     }
 
     fun updateServerUrl(url: String) {
@@ -61,13 +91,16 @@ object AlertStateHolder {
         _state.value = _state.value.copy(
             mockLocationOverride = point,
             userLocation = point ?: _state.value.userLocation,
+            locationSource = if (point != null) "mock" else _state.value.locationSource,
         )
     }
 
     fun setMockBattery(pct: Int?) {
-        _state.value = _state.value.copy(
+        val current = _state.value
+        _state.value = current.copy(
             mockBatteryOverride = pct,
-            batteryPct = pct ?: _state.value.batteryPct,
+            batteryPct = pct ?: current.batteryPct,
+            reservePowerActive = if (pct != null) pct <= 5 else false,
         )
     }
 

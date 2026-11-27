@@ -222,8 +222,20 @@ class AlertActivity : ComponentActivity() {
 
     private fun openEmergencyDialer() {
         runCatching {
-            val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:112"))
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            if (am.lockTaskModeState != ActivityManager.LOCK_TASK_MODE_NONE) {
+                runCatching { stopLockTask() }
+            }
+            val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:112")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
             startActivity(dialIntent)
+        }.onFailure {
+            android.widget.Toast.makeText(
+                this,
+                "Dialer unavailable on this device — call 112 manually",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
         }
     }
 

@@ -28,14 +28,26 @@ class AlertService : Service() {
         private const val ALARM_NOTIFICATION_ID = 1002
         private const val POLL_INTERVAL_SECONDS = 2L
 
-        fun start(context: Context) {
-            val intent = Intent(context, AlertService::class.java)
+        const val ACTION_START = "com.argo.alert.ACTION_START"
+        const val ACTION_POLL_NOW = "com.argo.alert.ACTION_POLL_NOW"
+        const val ACTION_REFRESH_TELEMETRY = "com.argo.alert.ACTION_REFRESH_TELEMETRY"
+        const val ACTION_RESTART = "com.argo.alert.ACTION_RESTART"
+
+        private fun sendAction(context: Context, action: String) {
+            val intent = Intent(context, AlertService::class.java).apply {
+                this.action = action
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {
                 context.startService(intent)
             }
         }
+
+        fun start(context: Context) = sendAction(context, ACTION_START)
+        fun pollNow(context: Context) = sendAction(context, ACTION_POLL_NOW)
+        fun refreshTelemetry(context: Context) = sendAction(context, ACTION_REFRESH_TELEMETRY)
+        fun restart(context: Context) = sendAction(context, ACTION_RESTART)
     }
 
     private lateinit var telemetry: DeviceTelemetry
@@ -56,6 +68,24 @@ class AlertService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_POLL_NOW -> {
+                triggerImmediatePoll()
+            }
+            ACTION_REFRESH_TELEMETRY -> {
+                telemetry.startLocationUpdates(forceRefresh = true)
+                syncTelemetryToState()
+                triggerImmediatePoll()
+            }
+            ACTION_RESTART -> {
+                if (activeAlertId == null) {
+                    seenPayloads.clear()
+                }
+                telemetry.startLocationUpdates(forceRefresh = true)
+                restartPollingLoop()
+                syncTelemetryToState()
+            }
+        }
         return START_STICKY
     }
 
@@ -131,18 +161,42 @@ class AlertService : Service() {
         )
     }
 
+    private fun restartPollingLoop() {
+        scheduler?.shutdownNow()
+        scheduler = null
+        startPollingLoop()
+    }
+
+    private fun triggerImmediatePoll() {
+        val exec = scheduler
+        if (exec == null || exec.isShutdown) {
+            startPollingLoop()
+        } else {
+            runCatching { exec.execute { pollOnce() } }
+        }
+    }
+
+    private fun syncTelemetryToState() {
+        val location = telemetry.getCurrentLocation()
+        val batteryPct = telemetry.getBatteryPercentage()
+        AlertStateHolder.updateLocation(location, telemetry.locationSource())
+        AlertStateHolder.updateBattery(batteryPct)
+    }
+
     private fun pollOnce() {
         try {
             val location = telemetry.getCurrentLocation()
             val batteryPct = telemetry.getBatteryPercentage()
-            AlertStateHolder.updateLocation(location)
+            val source = telemetry.locationSource()
+            AlertStateHolder.updateLocation(location, source)
             AlertStateHolder.updateBattery(batteryPct)
 
-            val response = EventClient.poll(location.lat, location.lon, batteryPct, telemetry.locationSource()) ?: return
-
-            when (response.status) {
-                "ACTIVE" -> handleActivePoll(response, location, batteryPct)
-                "CLEARED" -> handleClearedPoll(response, location)
+            val responses = EventClient.pollAll(location.lat, location.lon, batteryPct, source)
+            for (response in responses) {
+                when (response.status) {
+                    "ACTIVE" -> handleActivePoll(response, location, batteryPct)
+                    "CLEARED" -> handleClearedPoll(response, location)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error in poll loop: ${e.message}", e)

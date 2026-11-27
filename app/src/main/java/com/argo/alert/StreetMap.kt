@@ -39,7 +39,12 @@ fun StreetEvacuationMap(
     val nearestPair = remember(userLocation, shelters) {
         CryptoAndGeo.findNearestShelter(userLocation.lat, userLocation.lon, shelters)
     }
-    val fitState = remember { object { var key: String = "" } }
+    val mapState = remember {
+        object {
+            var fitKey: String = ""
+            var renderKey: String = ""
+        }
+    }
 
     val mapView = remember {
         runCatching {
@@ -59,7 +64,11 @@ fun StreetEvacuationMap(
     }
 
     DisposableEffect(mapView) {
-        onDispose { mapView.onDetach() }
+        mapView.onResume()
+        onDispose {
+            mapView.onPause()
+            mapView.onDetach()
+        }
     }
 
     fun dot(color: Int, sizeDp: Int): GradientDrawable =
@@ -75,6 +84,11 @@ fun StreetEvacuationMap(
         modifier = modifier,
         factory = { mapView },
         update = { mv ->
+            val currentRenderKey =
+                "${userLocation.lat},${userLocation.lon}|${region.center.lat},${region.center.lon},${region.radiusKm}|${shelters.size}|${nearestPair?.first?.name}"
+            if (currentRenderKey == mapState.renderKey) return@AndroidView
+            mapState.renderKey = currentRenderKey
+
             mv.overlays.clear()
             val user = OsmPoint(userLocation.lat, userLocation.lon)
             val nearest = nearestPair?.first
@@ -147,8 +161,8 @@ fun StreetEvacuationMap(
             // Fit the view to you + nearest shelter + route, but only when the target changes,
             // so the person can still pan and zoom.
             val key = "${nearest?.name}:${nearest?.route?.size}"
-            if (key != fitState.key) {
-                fitState.key = key
+            if (key != mapState.fitKey) {
+                mapState.fitKey = key
                 val all = buildList {
                     add(user)
                     addAll(routePoints)

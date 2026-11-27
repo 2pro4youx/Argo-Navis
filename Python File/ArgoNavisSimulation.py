@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-argo_sim.py - the "outside world" for the Argo Navis emergency-layer demo.
+ArgoNavisSimulation.py - the "outside world" for the Argo Navis emergency-layer demo.
 Python standard library only. Nothing to install.
 
-  python argo_sim.py server            # alert gateway + rescue control room (open http://localhost:8000)
-  python argo_sim.py device            # reference device: same logic the Android app must implement
-  python argo_sim.py shelters --lat 23.1 --lon 77.4   # test/warm the real-shelter + walking-route lookup
+  python ArgoNavisSimulation.py server            # alert gateway + rescue control room (open http://localhost:8000)
+  python ArgoNavisSimulation.py device            # reference device via IP/HTTP
+  python ArgoNavisSimulation.py device --firebase # reference device via Firebase Firestore (no IP/port-forward)
+  python ArgoNavisSimulation.py shelters --lat 23.1 --lon 77.4   # test/warm the real-shelter + walking-route lookup
 
 SERVER  = stands in for the government / telecom alert source AND the rescue control room.
+          Runs both the local IP/HTTP endpoints AND Firebase Firestore channel sync side by side.
 DEVICE  = a terminal "phone" that verifies signatures, checks the region, runs the check-in
-          timer and escalates. Use it to test the server without Android, and as the fallback
-          demo if the emulator misbehaves. The Android app talks to the same HTTP endpoints.
+          timer and escalates. Works over IP/HTTP or Firebase Firestore.
 """
 import argparse
 import hashlib
 import hmac
 import json
 import math
+import re
 import threading
 from pathlib import Path
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -32,8 +35,6 @@ ROUTE_CACHE = Path("data/routes_cache.json")
 # Free walking routes from the FOSSGIS OSRM demo server (OpenStreetMap data). Fair use: ~1 request/second.
 ROUTING_URL = "https://routing.openstreetmap.de/routed-foot/route/v1/foot/{lo1},{la1};{lo2},{la2}?overview=full&geometries=geojson"
 WALK_KMH = 5.0
-# OpenStreetMap amenity -> label. These are REAL buildings near the user, used as candidate shelters.
-# They are not officially designated relief camps; production would use the state SDMA shelter list.
 SHELTER_TAGS = {"community_centre": "Community Hall", "townhall": "Town Hall", "school": "School",
                 "college": "College", "university": "University", "place_of_worship": "Place of Worship",
                 "hospital": "Hospital"}
@@ -67,6 +68,13 @@ PROTOCOLS = {
                  "Do not return until authorities allow it.",
                  "Go to the nearest shelter and register your arrival."],
 }
+
+DEFAULT_FIREBASE_CONFIG = {
+    "projectId": "circular-xray-qk4jk",
+    "apiKey": "AIzaSyBkA0F4-H_LzAQLQE5QYjCmMOfDUjrzXnU",
+    "firestoreDatabaseId": "ai-studio-argonavis-bb9b0c5f-87c9-4702-a6e0-f204cdfc39a3",
+}
+DEFAULT_CHANNEL = "argo-default"
 
 LOCK = threading.Lock()
 STATE = {"alert": None, "devices": {}, "events": []}
@@ -227,10 +235,338 @@ def make_alert(place, atype, severity, radius_km, interval_s, forged=False,
     return alert
 
 
+# --------------------------------------------------------- Firebase REST -
+def load_firebase_config(explicit_path=None):
+    candidates = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    here = Path(__file__).resolve().parent
+    candidates.extend([
+        Path.cwd() / "firebase-applet-config.json",
+        here / "firebase-applet-config.json",
+        here.parent / "firebase-applet-config.json",
+    ])
+    for p in candidates:
+        try:
+            if p.is_file():
+                cfg = json.loads(p.read_text(encoding="utf-8"))
+                if cfg.get("projectId") and cfg.get("apiKey") and cfg.get("firestoreDatabaseId"):
+                    return cfg, str(p)
+        except Exception:
+            pass
+    return dict(DEFAULT_FIREBASE_CONFIG), "built-in"
+
+
+def _fs_encode_val(v):
+    if v is None:
+        return {"nullValue": None}
+    if isinstance(v, bool):
+        return {"booleanValue": v}
+    if isinstance(v, int):
+        return {"integerValue": str(v)}
+    if isinstance(v, float):
+        return {"doubleValue": v}
+    return {"stringValue": str(v)}
+
+
+def _fs_decode_val(v):
+    if "stringValue" in v:
+        return v["stringValue"]
+    if "booleanValue" in v:
+        return bool(v["booleanValue"])
+    if "integerValue" in v:
+        return int(v["integerValue"])
+    if "doubleValue" in v:
+        return float(v["doubleValue"])
+    if "nullValue" in v:
+        return None
+    return None
+
+
+def _fs_encode_fields(d):
+    return {"fields": {k: _fs_encode_val(val) for k, val in d.items()}}
+
+
+def _fs_decode_doc(doc):
+    name = doc.get("name", "")
+    doc_id = name.rsplit("/", 1)[-1] if "/" in name else name
+    fields = {k: _fs_decode_val(v) for k, v in (doc.get("fields") or {}).items()}
+    return doc_id, fields
+
+
+def _sanitize_id(raw, default="argo-default", min_len=1):
+    cleaned = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(raw or "").strip())[:64]
+    if len(cleaned) < min_len:
+        return default
+    return cleaned
+
+
+class FirestoreClient:
+    def __init__(self, config):
+        self.project_id = config["projectId"]
+        self.database_id = config["firestoreDatabaseId"]
+        self.api_key = config["apiKey"]
+        self.base = (
+            f"https://firestore.googleapis.com/v1/projects/{self.project_id}"
+            f"/databases/{self.database_id}/documents"
+        )
+
+    def _url(self, path, params=None):
+        q = {"key": self.api_key}
+        if params:
+            q.update(params)
+        return f"{self.base}/{path.lstrip('/')}?{urllib.parse.urlencode(q)}"
+
+    def get_doc(self, path):
+        req = urllib.request.Request(self._url(path), headers={"Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                return _fs_decode_doc(json.loads(r.read()))[1]
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise RuntimeError(f"Firestore GET {path} HTTP {e.code}: {e.read().decode(errors='ignore')}")
+
+    def patch_doc(self, path, data):
+        body = json.dumps(_fs_encode_fields(data)).encode("utf-8")
+        req = urllib.request.Request(
+            self._url(path),
+            data=body,
+            method="PATCH",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                return _fs_decode_doc(json.loads(r.read()))[1]
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Firestore PATCH {path} HTTP {e.code}: {e.read().decode(errors='ignore')}")
+
+    def list_docs(self, collection_path, page_size=100):
+        parts = collection_path.strip("/").split("/")
+        col_id = parts[-1]
+        parent = "/".join(parts[:-1])
+        parent_prefix = f"/{parent}" if parent else ""
+        url = f"{self.base}{parent_prefix}:runQuery?{urllib.parse.urlencode({'key': self.api_key})}"
+        q = {"structuredQuery": {"from": [{"collectionId": col_id}], "limit": page_size}}
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(q).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                rows = json.loads(r.read())
+                return [_fs_decode_doc(row["document"]) for row in rows if isinstance(row, dict) and "document" in row]
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return []
+            raise RuntimeError(f"Firestore LIST {collection_path} HTTP {e.code}: {e.read().decode(errors='ignore')}")
+
+    def delete_doc(self, path):
+        req = urllib.request.Request(self._url(path), method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                r.read()
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise RuntimeError(f"Firestore DELETE {path} HTTP {e.code}")
+
+
+class FirebaseBridge:
+    def __init__(self, config, channel_id=DEFAULT_CHANNEL, enabled=True):
+        self.enabled = enabled
+        self.channel_id = _sanitize_id(channel_id, DEFAULT_CHANNEL, min_len=4)
+        self.client = FirestoreClient(config) if enabled else None
+        self.status = "Connecting..." if enabled else "Disabled"
+        self.last_error = ""
+        self.last_sync = 0.0
+        self.seen_event_ids = set()
+        self._op_lock = threading.Lock()
+
+    def set_channel(self, new_channel):
+        cleaned = _sanitize_id(new_channel, DEFAULT_CHANNEL, min_len=4)
+        with self._op_lock:
+            self.channel_id = cleaned
+            self.seen_event_ids.clear()
+            self.status = "Switching channel..." if self.enabled else "Disabled"
+        if self.enabled:
+            self.bootstrap_channel()
+            self.sync_once()
+        return cleaned
+
+    def bootstrap_channel(self):
+        if not self.enabled or not self.client:
+            return
+        try:
+            with self._op_lock:
+                ch = self.channel_id
+            existing = self.client.get_doc(f"channels/{ch}")
+            if existing is None:
+                self.push_none()
+            elif existing.get("status") in ("ACTIVE", "CLEARED") and existing.get("payload"):
+                with LOCK:
+                    if STATE["alert"] is None:
+                        STATE["alert"] = {
+                            "payload": existing["payload"],
+                            "sig": existing.get("sig", ""),
+                            "clear_sig": existing.get("clear_sig", ""),
+                            "alg": existing.get("alg", "HMAC-SHA256"),
+                            "status": existing["status"],
+                        }
+            self.status = "Connected"
+            self.last_error = ""
+        except Exception as e:
+            self.status = f"Error: {e}"
+            self.last_error = str(e)
+
+    def push_alert(self, alert_dict):
+        if not self.enabled or not self.client:
+            return
+        try:
+            clean_payload = alert_dict["payload"].replace(',"tampered":true', "")
+            aid = json.loads(clean_payload).get("alert_id", "")
+            with self._op_lock:
+                ch = self.channel_id
+            self.client.patch_doc(f"channels/{ch}", {
+                "channel_id": ch,
+                "status": str(alert_dict.get("status", "ACTIVE"))[:16],
+                "payload": str(alert_dict.get("payload", ""))[:131072],
+                "sig": str(alert_dict.get("sig", ""))[:128],
+                "clear_sig": str(alert_dict.get("clear_sig", ""))[:128],
+                "alg": str(alert_dict.get("alg", "HMAC-SHA256"))[:32],
+                "alert_id": str(aid)[:64],
+                "updated_at": float(time.time()),
+            })
+            self.status = "Connected"
+            self.last_error = ""
+        except Exception as e:
+            self.status = f"Sync error"
+            self.last_error = str(e)
+            print(f"[firebase] push_alert failed: {e}", flush=True)
+
+    def push_none(self):
+        if not self.enabled or not self.client:
+            return
+        try:
+            with self._op_lock:
+                ch = self.channel_id
+            self.client.patch_doc(f"channels/{ch}", {
+                "channel_id": ch,
+                "status": "NONE",
+                "payload": "",
+                "sig": "",
+                "clear_sig": "",
+                "alg": "HMAC-SHA256",
+                "alert_id": "",
+                "updated_at": float(time.time()),
+            })
+            self.status = "Connected"
+            self.last_error = ""
+        except Exception as e:
+            self.status = "Sync error"
+            self.last_error = str(e)
+            print(f"[firebase] push_none failed: {e}", flush=True)
+
+    def reset_channel(self):
+        if not self.enabled or not self.client:
+            return
+        try:
+            with self._op_lock:
+                ch = self.channel_id
+                self.seen_event_ids.clear()
+            self.push_none()
+            for dev_id, _ in self.client.list_docs(f"channels/{ch}/devices"):
+                self.client.delete_doc(f"channels/{ch}/devices/{dev_id}")
+            for ev_id, _ in self.client.list_docs(f"channels/{ch}/events"):
+                self.client.delete_doc(f"channels/{ch}/events/{ev_id}")
+        except Exception as e:
+            self.status = "Sync error"
+            self.last_error = str(e)
+            print(f"[firebase] reset_channel failed: {e}", flush=True)
+
+    def sync_once(self):
+        if not self.enabled or not self.client:
+            return
+        try:
+            with self._op_lock:
+                ch = self.channel_id
+            fb_devices = self.client.list_docs(f"channels/{ch}/devices", page_size=100)
+            fb_events = self.client.list_docs(f"channels/{ch}/events", page_size=100)
+
+            fb_events.sort(key=lambda pair: float(pair[1].get("ts") or 0.0))
+
+            with LOCK:
+                for dev_id, doc in fb_devices:
+                    has_fix = bool(doc.get("has_fix", False))
+                    lat = float(doc["lat"]) if has_fix and doc.get("lat") is not None else None
+                    lon = float(doc["lon"]) if has_fix and doc.get("lon") is not None else None
+                    battery = int(doc["battery"]) if doc.get("battery") is not None else None
+                    src = doc.get("src", "unknown")
+                    last_seen = float(doc.get("last_seen") or 0.0)
+                    existing = STATE["devices"].get(dev_id)
+                    if existing is None:
+                        d = touch_device(dev_id, lat, lon, battery, src, via="Firebase", last_seen_override=last_seen)
+                        if doc.get("status") in STATUS_FOR.values() or doc.get("status") == "IDLE":
+                            d["status"] = doc["status"]
+                        dl = float(doc.get("deadline") or 0.0)
+                        if dl > 0:
+                            d["deadline"] = dl
+                    else:
+                        if last_seen >= existing.get("fb_last_seen", 0.0):
+                            existing["fb_last_seen"] = last_seen
+                            if last_seen >= existing.get("http_last_seen", 0.0):
+                                if lat is not None and lon is not None:
+                                    existing["lat"], existing["lon"] = lat, lon
+                                if battery is not None:
+                                    existing["battery"] = battery
+                                existing["src"] = src
+                                existing["last_seen"] = max(existing["last_seen"], last_seen)
+                                dl = float(doc.get("deadline") or 0.0)
+                                if dl > 0:
+                                    existing["deadline"] = dl
+                            existing["via"] = (
+                                "IP + Firebase"
+                                if time.time() - existing.get("http_last_seen", 0.0) < 12.0
+                                else "Firebase"
+                            )
+
+                for ev_id, doc in fb_events:
+                    if ev_id in self.seen_event_ids:
+                        continue
+                    self.seen_event_ids.add(ev_id)
+                    has_coords = bool(doc.get("has_coords", False))
+                    ev_lat = float(doc["lat"]) if has_coords and doc.get("lat") is not None else None
+                    ev_lon = float(doc["lon"]) if has_coords and doc.get("lon") is not None else None
+                    iv = int(doc.get("interval_s") or 0)
+                    ev_ts = float(doc.get("ts") or time.time())
+                    apply_event({
+                        "device": doc.get("device", "dev1"),
+                        "event": doc.get("kind", "UNKNOWN"),
+                        "detail": doc.get("detail", ""),
+                        "lat": ev_lat,
+                        "lon": ev_lon,
+                        "interval_s": iv if iv > 0 else None,
+                    }, via="Firebase", ts_override=ev_ts)
+
+            self.status = "Connected"
+            self.last_error = ""
+            self.last_sync = time.time()
+        except Exception as e:
+            self.status = "Sync error"
+            self.last_error = str(e)
+
+
+BRIDGE: FirebaseBridge | None = None
+
+
 # ------------------------------------------------------------- state -----
-def log_event(device, kind, detail="", lat=None, lon=None):
-    STATE["events"].append({"ts": time.time(), "device": device, "kind": kind,
-                            "detail": detail, "lat": lat, "lon": lon})
+def log_event(device, kind, detail="", lat=None, lon=None, ts_override=None):
+    STATE["events"].append({
+        "ts": ts_override if ts_override is not None else time.time(),
+        "device": device, "kind": kind, "detail": detail, "lat": lat, "lon": lon
+    })
+    STATE["events"].sort(key=lambda x: x["ts"])
     del STATE["events"][:-300]
 
 
@@ -238,14 +574,24 @@ STATUS_FOR = {"SIREN_ON": "ALERTED", "SLIDER_CONFIRMED": "EVACUATING",
               "CHECKIN": "CHECKED_IN", "ESCALATED": "ESCALATED", "ALL_CLEAR": "IDLE"}
 
 
-def touch_device(dev, lat=None, lon=None, battery=None, src=None):
-    d = STATE["devices"].setdefault(dev, {"id": dev, "status": "IDLE", "lat": None, "lon": None,
-                                          "battery": None, "last_seen": 0, "deadline": None, "src": "-"})
+def touch_device(dev, lat=None, lon=None, battery=None, src=None, via="IP", last_seen_override=None):
+    d = STATE["devices"].setdefault(dev, {
+        "id": dev, "status": "IDLE", "lat": None, "lon": None,
+        "battery": None, "last_seen": 0, "deadline": None, "src": "-",
+        "via": via, "http_last_seen": 0.0, "fb_last_seen": 0.0,
+    })
+    now = last_seen_override if last_seen_override is not None else time.time()
     if src is not None:
         d["src"] = src
     if d["last_seen"] == 0:
-        log_event(dev, "DEVICE_ONLINE")
-    d["last_seen"] = time.time()
+        log_event(dev, "DEVICE_ONLINE", f"via {via}", ts_override=now)
+    d["last_seen"] = max(d["last_seen"], now)
+    if via == "IP":
+        d["http_last_seen"] = time.time()
+        d["via"] = "IP + Firebase" if time.time() - d.get("fb_last_seen", 0.0) < 12.0 else "IP"
+    else:
+        d["fb_last_seen"] = max(d.get("fb_last_seen", 0.0), now)
+        d["via"] = "IP + Firebase" if time.time() - d.get("http_last_seen", 0.0) < 12.0 else "Firebase"
     if lat is not None and lon is not None:
         d["lat"], d["lon"] = lat, lon
     if battery is not None:
@@ -253,17 +599,18 @@ def touch_device(dev, lat=None, lon=None, battery=None, src=None):
     return d
 
 
-def apply_event(data):
+def apply_event(data, via="IP", ts_override=None):
     dev = data.get("device", "dev1")
     kind = data.get("event", "UNKNOWN")
     lat, lon = data.get("lat"), data.get("lon")
-    d = touch_device(dev, lat, lon)
-    log_event(dev, kind, data.get("detail", ""), lat, lon)
+    d = touch_device(dev, lat, lon, via=via, last_seen_override=ts_override)
+    log_event(dev, kind, data.get("detail", ""), lat, lon, ts_override=ts_override)
     if kind in STATUS_FOR:
         d["status"] = STATUS_FOR[kind]
     iv = data.get("interval_s")
+    ev_ts = ts_override if ts_override is not None else time.time()
     if kind in ("SLIDER_CONFIRMED", "CHECKIN") and iv:
-        d["deadline"] = time.time() + iv
+        d["deadline"] = ev_ts + iv
     if kind in ("ESCALATED", "ALL_CLEAR"):
         d["deadline"] = None
 
@@ -274,8 +621,20 @@ def public_state():
     if out:
         out["body"] = json.loads(alert["payload"].replace(',"tampered":true', "")) if alert else None
         out["forged"] = not verify(alert)
-    return {"now": time.time(), "alert": out, "devices": list(STATE["devices"].values()),
-            "events": STATE["events"][-60:]}
+    fb_info = {
+        "enabled": bool(BRIDGE and BRIDGE.enabled),
+        "channel": BRIDGE.channel_id if BRIDGE else DEFAULT_CHANNEL,
+        "status": BRIDGE.status if BRIDGE else "Disabled",
+        "error": BRIDGE.last_error if BRIDGE else "",
+        "project_id": BRIDGE.client.project_id if (BRIDGE and BRIDGE.client) else "",
+    }
+    return {
+        "now": time.time(),
+        "alert": out,
+        "devices": list(STATE["devices"].values()),
+        "events": STATE["events"][-60:],
+        "firebase": fb_info,
+    }
 
 
 # -------------------------------------------------------------- HTTP -----
@@ -303,7 +662,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/device/poll":
                 f = lambda k: float(q[k][0]) if k in q else None
                 b = int(q["battery"][0]) if "battery" in q else None
-                touch_device(q.get("device", ["dev1"])[0], f("lat"), f("lon"), b, q.get("src", ["unknown"])[0])
+                touch_device(q.get("device", ["dev1"])[0], f("lat"), f("lon"), b, q.get("src", ["unknown"])[0], via="IP")
                 return self._send({"alert": STATE["alert"], "server_time": time.time()})
         self._send({"error": "not found"}, 404)
 
@@ -316,7 +675,7 @@ class Handler(BaseHTTPRequestHandler):
                     live = [d for d in STATE["devices"].values() if d["lat"] is not None and d.get("src") != "none"]
                 if not live:
                     return self._send({"error": "No device has a GPS fix yet. Open the app with location on and "
-                                                "'Allow all the time', or type a lat/lon."}, 400)
+                                                "'Allow all the time' (or tap Bhopal/Chennai GPS), or type a lat/lon."}, 400)
                 d = max(live, key=lambda x: x["last_seen"])
                 center, place = (d["lat"], d["lon"]), "your area"
             else:
@@ -326,12 +685,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send({"error": f"bad location: {e}"}, 400)
         shelters, source = find_shelters(*center)  # network calls, deliberately outside LOCK
         shelters = attach_routes(center, shelters)
+        alert_obj = make_alert(place, data.get("type", "FLOOD"), data.get("severity", "WARNING"),
+                               float(data.get("radius_km", 15)), int(data.get("checkin_interval_s", 600)),
+                               bool(data.get("forged")), center, shelters, source)
         with LOCK:
-            STATE["alert"] = make_alert(place, data.get("type", "FLOOD"), data.get("severity", "WARNING"),
-                                        float(data.get("radius_km", 15)), int(data.get("checkin_interval_s", 600)),
-                                        bool(data.get("forged")), center, shelters, source)
+            STATE["alert"] = alert_obj
             log_event("GATEWAY", "ALERT_SENT" + (" (FORGED)" if data.get("forged") else ""),
                       f"centre {center[0]:.5f},{center[1]:.5f}; shelters: {source}")
+        if BRIDGE and BRIDGE.enabled:
+            threading.Thread(target=BRIDGE.push_alert, args=(dict(alert_obj),), daemon=True).start()
         self._send({"ok": True, "center": center, "shelters": len(shelters), "shelter_source": source})
 
     def do_POST(self):
@@ -339,26 +701,57 @@ class Handler(BaseHTTPRequestHandler):
         data = json.loads(self.rfile.read(n) or b"{}")
         if self.path == "/api/alert":
             return self._create_alert(data)
+        if self.path == "/api/firebase/channel":
+            if not BRIDGE or not BRIDGE.enabled:
+                return self._send({"error": "Firebase bridge is disabled"}, 400)
+            ch = BRIDGE.set_channel(data.get("channel", DEFAULT_CHANNEL))
+            return self._send({"ok": True, "channel": ch})
+        alert_copy = None
+        do_reset = False
         with LOCK:
             if self.path == "/api/clear":
                 if STATE["alert"]:
                     aid = json.loads(STATE["alert"]["payload"].replace(',"tampered":true', ""))["alert_id"]
                     STATE["alert"]["status"] = "CLEARED"
                     STATE["alert"]["clear_sig"] = sign(f"{aid}|CLEARED")
+                    alert_copy = dict(STATE["alert"])
                     log_event("GATEWAY", "ALL_CLEAR_SENT", aid)
             elif self.path == "/api/device/event":
-                apply_event(data)
+                apply_event(data, via="IP")
             elif self.path == "/api/reset":
                 STATE.update({"alert": None, "devices": {}, "events": []})
+                do_reset = True
             else:
                 return self._send({"error": "not found"}, 404)
+        if alert_copy and BRIDGE and BRIDGE.enabled:
+            threading.Thread(target=BRIDGE.push_alert, args=(alert_copy,), daemon=True).start()
+        if do_reset and BRIDGE and BRIDGE.enabled:
+            threading.Thread(target=BRIDGE.reset_channel, daemon=True).start()
         self._send({"ok": True})
 
 
-def run_server(port):
+def _firebase_sync_loop(bridge: FirebaseBridge):
+    bridge.bootstrap_channel()
+    while True:
+        bridge.sync_once()
+        time.sleep(1.5)
+
+
+def run_server(port, firebase_cfg=None, channel=DEFAULT_CHANNEL, enable_firebase=True):
+    global BRIDGE
+    if enable_firebase and firebase_cfg:
+        BRIDGE = FirebaseBridge(firebase_cfg, channel_id=channel, enabled=True)
+        threading.Thread(target=_firebase_sync_loop, args=(BRIDGE,), daemon=True).start()
+    else:
+        BRIDGE = FirebaseBridge(DEFAULT_FIREBASE_CONFIG, channel_id=channel, enabled=False)
+
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"Argo gateway + control room on http://localhost:{port}")
-    print(f"Android emulator reaches it at http://10.0.2.2:{port}   (physical phone: use this PC's LAN IP)")
+    print(f"IP mode: emulator http://10.0.2.2:{port} | USB adb reverse http://127.0.0.1:{port} | LAN PC IP:{port}")
+    if BRIDGE.enabled:
+        print(f"Firebase mode (no port-forward/IP needed): project={BRIDGE.client.project_id} channel='{BRIDGE.channel_id}'")
+    else:
+        print("Firebase mode: DISABLED (--no-firebase)")
     srv.serve_forever()
 
 
@@ -377,20 +770,78 @@ def _http(url, body=None):
         return json.loads(r.read())
 
 
-def run_device(a):
-    base, dev = a.server.rstrip("/"), a.device
+def run_device(a, firebase_cfg=None):
+    base, dev = a.server.rstrip("/"), _sanitize_id(a.device, "dev1")
+    channel = _sanitize_id(a.channel, DEFAULT_CHANNEL, min_len=4)
+    fs_client = FirestoreClient(firebase_cfg) if a.firebase and firebase_cfg else None
     say = lambda m: print(f"[{time.strftime('%H:%M:%S')}] {dev}: {m}", flush=True)
+    dev_status = "IDLE"
+    dev_deadline = 0.0
+
+    def poll():
+        if fs_client:
+            now = time.time()
+            fs_client.patch_doc(f"channels/{channel}/devices/{dev}", {
+                "id": dev,
+                "status": dev_status,
+                "lat": float(a.lat),
+                "lon": float(a.lon),
+                "has_fix": True,
+                "battery": int(max(0, min(100, a.battery))),
+                "src": "sim-fb",
+                "last_seen": float(now),
+                "deadline": float(dev_deadline),
+            })
+            doc = fs_client.get_doc(f"channels/{channel}")
+            if not doc or doc.get("status") == "NONE" or not doc.get("payload"):
+                return None
+            return doc
+        qs = urllib.parse.urlencode({"device": dev, "lat": a.lat, "lon": a.lon, "battery": a.battery, "src": "sim"})
+        return _http(f"{base}/api/device/poll?{qs}")["alert"]
 
     def post(event, detail="", **extra):
-        _http(f"{base}/api/device/event", {"device": dev, "event": event, "detail": detail,
-                                           "lat": a.lat, "lon": a.lon, **extra})
+        nonlocal dev_status, dev_deadline
+        if event in STATUS_FOR:
+            dev_status = STATUS_FOR[event]
+        iv = extra.get("interval_s")
+        if event in ("SLIDER_CONFIRMED", "CHECKIN") and iv:
+            dev_deadline = time.time() + iv
+        elif event in ("ESCALATED", "ALL_CLEAR"):
+            dev_deadline = 0.0
 
-    say(f"online at ({a.lat}, {a.lon}), battery {a.battery}%")
+        if fs_client:
+            ev_id = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+            fs_client.patch_doc(f"channels/{channel}/events/{ev_id}", {
+                "ts": float(time.time()),
+                "device": dev,
+                "kind": re.sub(r"[^A-Z0-9_]", "_", event.upper())[:48],
+                "detail": str(detail)[:512],
+                "lat": float(a.lat),
+                "lon": float(a.lon),
+                "has_coords": True,
+                "interval_s": int(iv or 0),
+            })
+            fs_client.patch_doc(f"channels/{channel}/devices/{dev}", {
+                "id": dev,
+                "status": dev_status,
+                "lat": float(a.lat),
+                "lon": float(a.lon),
+                "has_fix": True,
+                "battery": int(max(0, min(100, a.battery))),
+                "src": "sim-fb",
+                "last_seen": float(time.time()),
+                "deadline": float(dev_deadline),
+            })
+        else:
+            _http(f"{base}/api/device/event", {"device": dev, "event": event, "detail": detail,
+                                               "lat": a.lat, "lon": a.lon, **extra})
+
+    mode_desc = f"Firebase channel '{channel}'" if fs_client else f"HTTP {base}"
+    say(f"online via {mode_desc} at ({a.lat}, {a.lon}), battery {a.battery}%")
     handled, state, t0, deadline, next_press, done = set(), "IDLE", 0, 0, 0, 0
     body, shelter, esc_polls = None, None, 0
     while True:
-        qs = urllib.parse.urlencode({"device": dev, "lat": a.lat, "lon": a.lon, "battery": a.battery, "src": "sim"})
-        alert = _http(f"{base}/api/device/poll?{qs}")["alert"]
+        alert = poll()
         now = time.time()
 
         if alert and body and alert.get("status") == "CLEARED" and state != "IDLE":
@@ -449,7 +900,7 @@ def run_device(a):
             esc_polls += 1
             if a.exit_on_escalation and esc_polls >= 3:
                 return
-        time.sleep(1)
+        time.sleep(1.5 if fs_client else 1)
 
 
 # --------------------------------------------------------- dashboard -----
@@ -459,28 +910,40 @@ HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Arg
 <style>
 :root{--bg:#0c1116;--panel:#151c24;--line:#2a3540;--txt:#f2ede4;--mut:#9aa7b2;--amb:#ffb000;--red:#ff3b3b;--grn:#3ddc97;--cy:#38bdf8}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.4 system-ui,Segoe UI,Arial,sans-serif}
-header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 h1{font:700 18px Georgia,serif;margin:0;letter-spacing:.5px}h1 span{color:var(--amb)}
-.grid{display:grid;grid-template-columns:330px 1fr;gap:14px;padding:14px;align-items:start}
+.grid{display:grid;grid-template-columns:340px 1fr;gap:14px;padding:14px;align-items:start}
 @media(max-width:900px){.grid{grid-template-columns:1fr}}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px;margin-bottom:14px}
 .card h2{font-size:11px;letter-spacing:2px;color:var(--amb);margin:0 0 10px;text-transform:uppercase}
 label{display:block;color:var(--mut);font-size:12px;margin:8px 0 3px}
 select,input{width:100%;padding:7px;background:#0c1116;color:var(--txt);border:1px solid var(--line);border-radius:4px}
 button{width:100%;margin-top:8px;padding:9px;border:0;border-radius:4px;font-weight:700;cursor:pointer;color:#0c1116;background:var(--amb)}
-button.red{background:var(--red);color:#fff}button.gry{background:#2a3540;color:var(--txt)}
+button.red{background:var(--red);color:#fff}button.gry{background:#2a3540;color:var(--txt)}button.sm{width:auto;margin:0;padding:7px 12px;font-size:12px}
 svg{width:100%;background:#0a0f14;border:1px solid var(--line);border-radius:4px}
 table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:4px 6px;border-bottom:1px solid var(--line);text-align:left}
 th{color:var(--mut);font-weight:500}.pill{padding:1px 7px;border-radius:9px;font-size:11px;font-weight:700;color:#0c1116}
 #log{max-height:280px;overflow:auto;font:12px ui-monospace,Consolas,monospace}
 #log div{padding:2px 0;border-bottom:1px solid #1d2630}.t{color:var(--mut)}
 pre{white-space:pre-wrap;word-break:break-all;font:11px ui-monospace,Consolas,monospace;color:var(--mut);margin:6px 0 0;max-height:170px;overflow:auto}
-.big{font-size:15px;font-weight:700}.ok{color:var(--grn)}.bad{color:var(--red)}
+.big{font-size:15px;font-weight:700}.ok{color:var(--grn)}.bad{color:var(--red)}.row{display:flex;gap:6px;align-items:center}
 @keyframes p{50%{opacity:.35}}.pulse{animation:p 1s infinite}
 </style></head><body>
-<header><h1>ARGO <span>NAVIS</span> &nbsp;/&nbsp; Alert Gateway + Rescue Control Room</h1><div id="clock" class="t"></div></header>
+<header>
+  <h1>ARGO <span>NAVIS</span> &nbsp;/&nbsp; Alert Gateway + Rescue Control Room</h1>
+  <div class="row" style="gap:16px">
+    <span id="fbstat" class="t">Firebase: ...</span>
+    <span id="clock" class="t"></span>
+  </div>
+</header>
 <div class="grid">
 <div>
+ <div class="card"><h2>Firebase + IP Transport</h2>
+  <div class="t" style="font-size:12px;margin-bottom:6px">Devices can connect via Firebase (no port-forwarding/IP needed) or direct IP/HTTP simultaneously.</div>
+  <label>Firebase Channel ID (match this in the Android app)</label>
+  <div class="row"><input id="fbchan" value="argo-default"><button class="gry sm" onclick="setChannel()">Apply</button></div>
+  <div id="fbdetail" class="t" style="font-size:11px;margin-top:6px"></div>
+ </div>
  <div class="card"><h2>Alert gateway (govt / telecom side)</h2>
   <label>Alert centre</label><select id="city"><option value="LIVE">My device (live GPS)</option><option>Bhopal</option><option>Chennai</option><option>Visakhapatnam</option><option>Guwahati</option></select>
   <label>Or type exact lat, lon (overrides the choice above)</label><div style="display:flex;gap:6px"><input id="lat" placeholder="lat"><input id="lon" placeholder="lon"></div>
@@ -497,7 +960,7 @@ pre{white-space:pre-wrap;word-break:break-all;font:11px ui-monospace,Consolas,mo
 </div>
 <div>
  <div class="card"><h2 id="maptitle">Live map</h2><div id="lmap" style="height:440px;border-radius:4px;display:none"></div><svg id="map" viewBox="0 0 560 420"></svg></div>
- <div class="card"><h2>Devices</h2><table><thead><tr><th>Device</th><th>Status</th><th>Battery</th><th>GPS source</th><th>Location</th><th>Next check-in</th></tr></thead><tbody id="devs"></tbody></table></div>
+ <div class="card"><h2>Devices</h2><table><thead><tr><th>Device</th><th>Status</th><th>Via</th><th>Battery</th><th>GPS source</th><th>Location</th><th>Next check-in</th></tr></thead><tbody id="devs"></tbody></table></div>
  <div class="card"><h2>What the firmware layer did (event log)</h2><div id="log"></div></div>
 </div></div>
 <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -508,7 +971,8 @@ const KC=k=>k.includes('FAIL')||k.includes('ESCALATED')||k.includes('FORGED')?'#
 const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 async function api(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let j={};try{j=await r.json()}catch(e){}if(!r.ok&&j.error)alert(j.error);tick();return j}
 function send(forged){const body={city:$('city').value,type:$('type').value,severity:$('sev').value,radius_km:+$('rad').value,checkin_interval_s:+$('int').value,forged};if($('lat').value&&$('lon').value){body.lat=+$('lat').value;body.lon=+$('lon').value}api('/api/alert',body)}
-let LM=null,LG=null,lastFit='';
+async function setChannel(){const ch=$('fbchan').value.trim();if(!ch)return;const r=await api('/api/firebase/channel',{channel:ch});if(r.channel)$('fbchan').value=r.channel}
+let LM=null,LG=null,lastFit='',chanInit=false;
 function initLeaflet(){
  if(LM)return true;if(typeof L==='undefined')return false;
  try{$('lmap').style.display='block';LM=L.map('lmap').setView([23.26,77.41],14);
@@ -529,6 +993,10 @@ function renderLeaflet(s,B){
  if(pts.length&&key!==lastFit){LM.fitBounds(pts,{padding:[40,40],maxZoom:17});lastFit=key}}
 function render(s){
  $('clock').textContent=new Date(s.now*1000).toLocaleTimeString();
+ const fb=s.firebase||{};
+ if(!chanInit&&fb.channel){$('fbchan').value=fb.channel;chanInit=true}
+ $('fbstat').innerHTML=`Firebase: <b class="${fb.status==='Connected'?'ok':fb.enabled?'bad':'t'}">${esc(fb.status||'Off')}</b> (${esc(fb.channel||'-')})`;
+ $('fbdetail').textContent=fb.enabled?`Project: ${fb.project_id} · ${fb.error||fb.status}`:'Firebase bridge disabled';
  const A=s.alert,B=A&&A.body;
  if(A){const bad=A.forged;
   $('alertinfo').innerHTML=`<div class="big">${esc(B.headline)}</div><div>Status: <b>${A.status}</b> &nbsp; Signature: <b class="${bad?'bad':'ok'}">${bad?'INVALID (forged)':'valid'}</b></div><div class="t">Check-in every ${B.checkin_interval_s}s &middot; radius ${B.region.radius_km} km</div><div class="t" style="margin-top:6px">Shelters (${esc(B.shelter_source||'')}):<br>${B.shelters.map(h=>esc(h.name)+' - '+(h.distance_km??'?')+' km').join('<br>')}</div>`;
@@ -548,7 +1016,7 @@ function render(s){
  if(initLeaflet()){$('lmap').style.display='block';$('map').style.display='none';$('maptitle').textContent='Live map (OpenStreetMap)';renderLeaflet(s,B)}
  else{$('maptitle').textContent='Live map (schematic, offline)'}
  $('devs').innerHTML=s.devices.map(d=>{const left=d.deadline?Math.max(0,Math.round(d.deadline-s.now))+'s':'-';
-  return `<tr><td>${esc(d.id)}</td><td><span class="pill" style="background:${COL[d.status]}">${d.status}</span></td><td>${d.battery??'-'}%</td><td>${esc(d.src||'-')}</td><td>${d.lat!=null?d.lat.toFixed(4)+', '+d.lon.toFixed(4):'-'}</td><td>${left}</td></tr>`}).join('')||'<tr><td colspan="6" class="t">No devices online</td></tr>';
+  return `<tr><td>${esc(d.id)}</td><td><span class="pill" style="background:${COL[d.status]}">${d.status}</span></td><td>${esc(d.via||'IP')}</td><td>${d.battery??'-'}%</td><td>${esc(d.src||'-')}</td><td>${d.lat!=null?d.lat.toFixed(4)+', '+d.lon.toFixed(4):'-'}</td><td>${left}</td></tr>`}).join('')||'<tr><td colspan="7" class="t">No devices online</td></tr>';
  $('log').innerHTML=s.events.slice().reverse().map(e=>`<div><span class="t">${new Date(e.ts*1000).toLocaleTimeString()}</span> <b style="color:${KC(e.kind)}">${esc(e.kind)}</b> <span class="t">${esc(e.device)} ${esc(e.detail)}</span></div>`).join('')}
 async function tick(){try{render(await (await fetch('/api/state')).json())}catch(e){}}
 setInterval(tick,1000);tick();
@@ -557,11 +1025,16 @@ setInterval(tick,1000);tick();
 
 def main():
     ap = argparse.ArgumentParser(description="Argo Navis demo gateway, control room and reference device")
+    ap.add_argument("--firebase-config", default=None, help="Path to firebase-applet-config.json")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("server")
     s.add_argument("--port", type=int, default=8000)
+    s.add_argument("--channel", default=DEFAULT_CHANNEL, help="Firebase Firestore channel ID")
+    s.add_argument("--no-firebase", action="store_true", help="Disable Firebase sync and run IP/HTTP only")
     d = sub.add_parser("device")
     d.add_argument("--server", default="http://127.0.0.1:8000")
+    d.add_argument("--firebase", action="store_true", help="Use Firebase Firestore instead of IP/HTTP")
+    d.add_argument("--channel", default=DEFAULT_CHANNEL, help="Firebase Firestore channel ID")
     d.add_argument("--device", default="dev1")
     d.add_argument("--lat", type=float, default=23.2599)
     d.add_argument("--lon", type=float, default=77.4126)
@@ -573,10 +1046,12 @@ def main():
     h.add_argument("--lat", type=float, required=True)
     h.add_argument("--lon", type=float, required=True)
     a = ap.parse_args()
+    fb_cfg, fb_src = load_firebase_config(a.firebase_config)
     if a.cmd == "server":
-        run_server(a.port)
+        print(f"Loaded Firebase config ({fb_src}): project={fb_cfg['projectId']} db={fb_cfg['firestoreDatabaseId']}")
+        run_server(a.port, firebase_cfg=fb_cfg, channel=a.channel, enable_firebase=not a.no_firebase)
     elif a.cmd == "device":
-        run_device(a)
+        run_device(a, firebase_cfg=fb_cfg)
     else:
         found, src = find_shelters(a.lat, a.lon)
         found = attach_routes((a.lat, a.lon), found)
