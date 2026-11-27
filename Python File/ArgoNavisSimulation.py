@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import threading
 from pathlib import Path
 import time
@@ -26,6 +27,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SECRET = b"argo-demo-shared-secret"  # DEMO ONLY. A real system uses asymmetric signatures, key in secure hardware.
+DEFAULT_FIREBASE_URL = "https://argo-navis-ad84c-default-rtdb.asia-southeast1.firebasedatabase.app"
+FIREBASE_URL = os.environ.get("ARGO_FIREBASE_URL", DEFAULT_FIREBASE_URL).strip().rstrip("/")
+_SEEN_FB_EVENTS = set()
+_FB_EPOCH = 0
+_FB_RESETTING = False
 OVERPASS_URLS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
 SHELTER_CACHE = Path("data/shelters_cache.json")
 ROUTE_CACHE = Path("data/routes_cache.json")
@@ -68,7 +74,7 @@ PROTOCOLS = {
                  "Go to the nearest shelter and register your arrival."],
 }
 
-LOCK = threading.Lock()
+LOCK = threading.RLock()
 STATE = {"alert": None, "devices": {}, "events": []}
 
 
@@ -268,6 +274,95 @@ def apply_event(data):
         d["deadline"] = None
 
 
+def _fb_request(path, method="GET", body=None):
+    if not FIREBASE_URL:
+        return None
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{FIREBASE_URL}/{path.lstrip('/')}",
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=4) as r:
+        raw = r.read().decode("utf-8").strip()
+        return None if not raw or raw == "null" else json.loads(raw)
+
+
+def _fb_push_alert_async(alert_snapshot):
+    if not FIREBASE_URL:
+        return
+
+    def _run():
+        try:
+            if alert_snapshot is None:
+                _fb_request("alert.json", method="DELETE")
+            else:
+                _fb_request("alert.json", method="PUT", body=alert_snapshot)
+        except Exception as e:
+            print(f"[firebase] alert sync failed: {e}", flush=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _fb_reset_async():
+    global _FB_RESETTING
+    if not FIREBASE_URL:
+        return
+    _FB_RESETTING = True
+
+    def _run():
+        global _FB_RESETTING
+        try:
+            for p in ("alert.json", "devices.json", "events.json"):
+                try:
+                    _fb_request(p, method="DELETE")
+                except Exception as e:
+                    print(f"[firebase] reset delete {p} failed: {e}", flush=True)
+        finally:
+            _FB_RESETTING = False
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _fb_sync_loop():
+    while FIREBASE_URL:
+        try:
+            if _FB_RESETTING:
+                time.sleep(0.5)
+                continue
+            with LOCK:
+                epoch = _FB_EPOCH
+            devs = _fb_request("devices.json")
+            evts = _fb_request("events.json")
+            with LOCK:
+                if _FB_RESETTING or epoch != _FB_EPOCH:
+                    time.sleep(0.5)
+                    continue
+                if isinstance(devs, dict):
+                    for dev_id, info in devs.items():
+                        if not isinstance(info, dict):
+                            continue
+                        d = touch_device(
+                            info.get("id", dev_id),
+                            info.get("lat"),
+                            info.get("lon"),
+                            info.get("battery"),
+                            info.get("src"),
+                        )
+                        if isinstance(info.get("last_seen"), (int, float)):
+                            d["last_seen"] = info["last_seen"]
+                if isinstance(evts, dict):
+                    for key, ev in sorted(evts.items()):
+                        if key in _SEEN_FB_EVENTS or not isinstance(ev, dict):
+                            continue
+                        _SEEN_FB_EVENTS.add(key)
+                        apply_event(ev)
+        except Exception as e:
+            print(f"[firebase] poll error: {e}", flush=True)
+        time.sleep(1.5)
+
+
 def public_state():
     alert = STATE["alert"]
     out = dict(alert) if alert else None
@@ -332,13 +427,19 @@ class Handler(BaseHTTPRequestHandler):
                                         bool(data.get("forged")), center, shelters, source)
             log_event("GATEWAY", "ALERT_SENT" + (" (FORGED)" if data.get("forged") else ""),
                       f"centre {center[0]:.5f},{center[1]:.5f}; shelters: {source}")
+            alert_snapshot = dict(STATE["alert"]) if STATE["alert"] else None
+        _fb_push_alert_async(alert_snapshot)
         self._send({"ok": True, "center": center, "shelters": len(shelters), "shelter_source": source})
 
     def do_POST(self):
+        global _FB_EPOCH
         n = int(self.headers.get("Content-Length", 0))
         data = json.loads(self.rfile.read(n) or b"{}")
         if self.path == "/api/alert":
             return self._create_alert(data)
+        alert_snapshot = None
+        push_alert = False
+        do_reset = False
         with LOCK:
             if self.path == "/api/clear":
                 if STATE["alert"]:
@@ -346,19 +447,32 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["alert"]["status"] = "CLEARED"
                     STATE["alert"]["clear_sig"] = sign(f"{aid}|CLEARED")
                     log_event("GATEWAY", "ALL_CLEAR_SENT", aid)
+                alert_snapshot = dict(STATE["alert"]) if STATE["alert"] else None
+                push_alert = True
             elif self.path == "/api/device/event":
                 apply_event(data)
             elif self.path == "/api/reset":
                 STATE.update({"alert": None, "devices": {}, "events": []})
+                _SEEN_FB_EVENTS.clear()
+                _FB_EPOCH += 1
+                do_reset = True
             else:
                 return self._send({"error": "not found"}, 404)
+        if push_alert:
+            _fb_push_alert_async(alert_snapshot)
+        if do_reset:
+            _fb_reset_async()
         self._send({"ok": True})
 
 
 def run_server(port):
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"Argo gateway + control room on http://localhost:{port}")
-    print(f"Android emulator reaches it at http://10.0.2.2:{port}   (physical phone: use this PC's LAN IP)")
+    if FIREBASE_URL:
+        print(f"Firebase RTDB sync enabled: {FIREBASE_URL}")
+        threading.Thread(target=_fb_sync_loop, daemon=True).start()
+    else:
+        print(f"Android emulator reaches it at http://10.0.2.2:{port}   (physical phone: use this PC's LAN IP)")
     srv.serve_forever()
 
 
@@ -556,10 +670,12 @@ setInterval(tick,1000);tick();
 
 
 def main():
+    global FIREBASE_URL
     ap = argparse.ArgumentParser(description="Argo Navis demo gateway, control room and reference device")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("server")
     s.add_argument("--port", type=int, default=8000)
+    s.add_argument("--firebase", default=FIREBASE_URL, help="Firebase RTDB URL (empty string to disable)")
     d = sub.add_parser("device")
     d.add_argument("--server", default="http://127.0.0.1:8000")
     d.add_argument("--device", default="dev1")
@@ -574,6 +690,7 @@ def main():
     h.add_argument("--lon", type=float, required=True)
     a = ap.parse_args()
     if a.cmd == "server":
+        FIREBASE_URL = (a.firebase or "").strip().rstrip("/")
         run_server(a.port)
     elif a.cmd == "device":
         run_device(a)

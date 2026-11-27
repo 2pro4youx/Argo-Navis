@@ -259,6 +259,23 @@ private fun BootstrapScreen(
             }
             Button(
                 onClick = {
+                    urlInput = EventClient.DEFAULT_BASE_URL
+                    onSaveServerUrl(EventClient.DEFAULT_BASE_URL)
+                },
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF065F46)),
+            ) {
+                Text("Firebase (Default)", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Button(
+                onClick = {
                     urlInput = "http://127.0.0.1:8000"
                     onSaveServerUrl("http://127.0.0.1:8000")
                 },

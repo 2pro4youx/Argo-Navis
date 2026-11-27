@@ -41,6 +41,28 @@ When a signed, localized disaster alert is verified, **ArgoNavis commandeers the
 5. **Maintains a dead-man's check-in loop**: if the user becomes unresponsive or trapped, it automatically transmits their exact GPS coordinates, battery reserve, and status to local emergency services and rescue command teams.
 
 ---
+## 🚀 Release Update — Wireless Firebase Sync & Stability Fixes
+
+### ✨ What's New
+- ☁️ **Zero-IP Wireless Sync (Firebase RTDB):** Added Firebase Realtime Database integration so the Android app and PC control room (`ArgoNavisSimulation.py`) communicate over any Wi-Fi or mobile data network—no LAN IP addresses or USB `adb reverse` setup required.
+- 📱 **One-Tap Firebase Preset:** Added a **Firebase (Default)** quick-select button in the Android app alongside **USB 127.0.0.1** and **Emu 10.0.2.2** for instant switching.
+- 🔄 **Live Gateway Sync:** `ArgoNavisSimulation.py` now automatically pushes active alerts and all-clear signals to Firebase RTDB while syncing live device GPS, battery telemetry, and firmware events (`--firebase` flag, enabled by default).
+- 🛡️ **Direct Boot Compatible:** Uses lightweight HTTPS REST calls in `EventClient.kt`, keeping background alert polling functional even before device unlock.
+
+### 🐛 Bug Fixes
+- 🔧 **Fixed Android Studio APK / Test Build Failure:** Resolved a `compose-bom` version conflict (`2026.02.01` vs `2024.09.03`) between `gradle/libs.versions.toml` and `app/build.gradle.kts` that caused `:app:assembleDebugAndroidTest` tasks to fail.
+- 🔒 **Fixed Control Room Deadlock:** Replaced non-reentrant `threading.Lock()` with `threading.RLock()` and moved Firebase sync calls outside the lock in `ArgoNavisSimulation.py`, fixing unresponsive **Send all-clear** and **Reset demo** buttons.
+- 📡 **Fixed Intermittent Missing Devices & Reset Race:** Added epoch/reset guards to the Firebase sync loop so devices stay consistently visible without restarting the Python server, and stale polls no longer repopulate cleared state after **Reset demo**.
+
+### ⚡ Quick Start
+1. Install the updated `app-debug.apk` on your Android device (uses **Firebase (Default)** out of the box).
+2. Start the PC control room:
+   ```bash
+   python "Python File/ArgoNavisSimulation.py" server --port 8000
+   ```
+3. Open `http://localhost:8000` in your browser to monitor your device and dispatch alerts wirelessly.
+
+---
 
 ## ⚡ Core Capabilities
 

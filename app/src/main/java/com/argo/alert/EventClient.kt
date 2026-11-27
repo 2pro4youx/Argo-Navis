@@ -16,13 +16,18 @@ import java.util.concurrent.Executors
 object EventClient {
 
     private const val TAG = "ArgoEventClient"
-    const val DEFAULT_BASE_URL = "http://10.0.2.2:8000"
+    const val DEFAULT_BASE_URL = "https://argo-navis-ad84c-default-rtdb.asia-southeast1.firebasedatabase.app"
     const val DEVICE_ID = "nord5"
     private const val PREFS_NAME = "argo_alert_config"
     private const val KEY_SERVER_URL = "server_url"
 
     @Volatile
     private var baseUrl: String = DEFAULT_BASE_URL
+
+    private fun isFirebaseRtdb(url: String): Boolean {
+        val lower = url.lowercase(Locale.US)
+        return lower.contains("firebaseio.com") || lower.contains("firebasedatabase.app")
+    }
 
     private val eventExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "argo-event-post").apply { isDaemon = true }
@@ -57,6 +62,9 @@ object EventClient {
     fun getBaseUrl(): String = baseUrl
 
     fun poll(lat: Double, lon: Double, batteryPct: Int, source: String = "gps"): PollResponse? {
+        if (isFirebaseRtdb(baseUrl)) {
+            return pollFirebase(lat, lon, batteryPct, source)
+        }
         val query = String.format(
             Locale.US,
             "device=%s&lat=%.6f&lon=%.6f&battery=%d&src=%s",
@@ -97,6 +105,63 @@ object EventClient {
         }
     }
 
+    private fun pollFirebase(lat: Double, lon: Double, batteryPct: Int, source: String): PollResponse? {
+        // 1. Update device telemetry in RTDB (best-effort)
+        runCatching {
+            val telemetry = JSONObject().apply {
+                put("id", DEVICE_ID)
+                put("lat", lat)
+                put("lon", lon)
+                put("battery", batteryPct)
+                put("src", source)
+                put("last_seen", System.currentTimeMillis() / 1000.0)
+            }.toString()
+            val putConn = (URL("$baseUrl/devices/$DEVICE_ID.json").openConnection() as HttpURLConnection).apply {
+                requestMethod = "PUT"
+                doOutput = true
+                connectTimeout = 3_000
+                readTimeout = 3_000
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            }
+            OutputStreamWriter(putConn.outputStream, StandardCharsets.UTF_8).use {
+                it.write(telemetry)
+                it.flush()
+            }
+            putConn.responseCode
+            putConn.disconnect()
+        }
+
+        // 2. Read current alert from RTDB
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL("$baseUrl/alert.json").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 3_000
+                readTimeout = 3_000
+                setRequestProperty("Accept", "application/json")
+            }
+            val code = conn.responseCode
+            if (code in 200..299) {
+                val body = BufferedReader(
+                    InputStreamReader(conn.inputStream, StandardCharsets.UTF_8)
+                ).use { it.readText() }.trim()
+                AlertStateHolder.updatePollStatus("Connected (Firebase)")
+                if (body.isBlank() || body == "null") null else AlertJsonParser.parsePollResponse(body)
+            } else {
+                Log.w(TAG, "Firebase poll returned HTTP $code")
+                AlertStateHolder.updatePollStatus("Firebase HTTP $code")
+                null
+            }
+        } catch (e: Exception) {
+            val msg = e.message ?: e.javaClass.simpleName
+            Log.w(TAG, "Firebase poll failed ($baseUrl): $msg")
+            AlertStateHolder.updatePollStatus("Offline: $msg")
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
     fun postEventSync(
         event: String,
         detail: String,
@@ -104,7 +169,8 @@ object EventClient {
         lon: Double,
         intervalS: Int? = null,
     ) {
-        val url = URL("$baseUrl/api/device/event")
+        val useFirebase = isFirebaseRtdb(baseUrl)
+        val url = URL(if (useFirebase) "$baseUrl/events.json" else "$baseUrl/api/device/event")
         var conn: HttpURLConnection? = null
         try {
             val payload = JSONObject().apply {
@@ -116,13 +182,16 @@ object EventClient {
                 if (intervalS != null) {
                     put("interval_s", intervalS)
                 }
+                if (useFirebase) {
+                    put("ts", System.currentTimeMillis() / 1000.0)
+                }
             }.toString()
 
             conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 doOutput = true
-                connectTimeout = 1_500
-                readTimeout = 1_500
+                connectTimeout = if (useFirebase) 3_000 else 1_500
+                readTimeout = if (useFirebase) 3_000 else 1_500
                 setRequestProperty("Content-Type", "application/json; charset=utf-8")
             }
             OutputStreamWriter(conn.outputStream, StandardCharsets.UTF_8).use { writer ->
