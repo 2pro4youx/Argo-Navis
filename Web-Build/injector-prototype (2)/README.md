@@ -1,93 +1,204 @@
-# Argo Alert (`com.argo.alert`) — Android OEM Emergency Layer
+<div align="center">
 
-An OEM-grade emergency alert and evacuation Android application written in **Kotlin** and **Jetpack Compose** with **zero third-party runtime dependencies** (pure Android SDK, `javax.crypto`, `HttpURLConnection`, `LocationManager`, `AudioTrack`, and `org.json`).
+<pre>
+   █████╗ ██████╗  ██████╗  ██████╗      █████╗ ██╗     ███████╗██████╗ ████████╗
+  ██╔══██╗██╔══██╗██╔════╝ ██╔═══██╗    ██╔══██╗██║     ██╔════╝██╔══██╗╚══██╔══╝
+  ███████║██████╔╝██║  ███╗██║   ██║    ███████║██║     █████╗  ██████╔╝   ██║
+  ██╔══██║██╔══██╗██║   ██║██║   ██║    ██╔══██║██║     ██╔══╝  ██╔══██╗   ██║
+  ██║  ██║██║  ██║╚██████╔╝╚██████╔╝    ██║  ██║███████╗███████╗██║  ██║   ██║
+  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝     ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝   ╚═╝
+</pre>
 
-Designed to bypass Do Not Disturb, lock screens, and normal app distractions during verified natural disasters, guide citizens to nearby relief shelters on an offline isotropic metric radar map, and escalate missed check-ins to rescue command.
-
----
-
-## Key Capabilities
-
-- **Direct-Boot Background Polling (`BootReceiver`, `AlertService`)**: Starts on `LOCKED_BOOT_COMPLETED` and `BOOT_COMPLETED` (`directBootAware="true"`) as a `START_STICKY` `specialUse` foreground service polling `GET /api/device/poll` every **2 seconds**.
-- **Constant-Time Cryptographic Verification (`CryptoAndGeo`)**: Verifies raw JSON alert payloads and `CLEARED` tokens using `HmacSHA256` (`javax.crypto.Mac`) and constant-time comparison (`MessageDigest.isEqual`) before parsing any fields.
-- **Haversine Geofencing & Play-Services-Free Telemetry (`DeviceTelemetry`, `CryptoAndGeo`)**: Arbitrates `GPS_PROVIDER` and `NETWORK_PROVIDER` via native `LocationManager`, rejects `(0.0, 0.0)` null fixes, and evaluates distance against `region.radius_km`.
-- **Reserved Power Mode (`AlertService`)**: Detects `BatteryManager` levels `<= 5%` and triggers `RESERVE_POWER_ACTIVE` telemetry while maintaining emergency visibility.
-- **Lock-Screen & Kiosk Takeover (`AlertActivity`, `AdminReceiver`)**: Wakes the display (`turnScreenOn`), draws over keyguard (`showWhenLocked`), falls back to a high-priority `FullScreenIntent` notification, and enforces `startLockTask()` when provisioned as Device Owner.
-- **Synthesized Hardware Siren & Haptics (`SirenController`)**: Generates an alternating **960 Hz / 720 Hz** two-tone siren (400 ms half-cycle) directly on `AudioAttributes.USAGE_ALARM` with alarm stream volume maximization and repeating vibration patterns for deaf/hard-of-hearing accessibility.
-- **Two-Screen Emergency Compose UI (`AlertActivity`)**:
-  - **Screen 1 (Takeover)**: Flashing high-contrast red warning screen, `SlideToEvacuate` swipe confirmation, and direct `ACTION_DIAL` (`tel:112`) emergency dialer trigger.
-  - **Screen 2 (Evacuation & Check-In)**: Offline isotropic `cos(lat)` metric Canvas map showing user GPS, nearest green shelter, walking/direct route vector, disaster-specific protocol steps, and a circular **CHECK-IN** countdown ring that automatically broadcasts `ESCALATED` with live coordinates if the timer hits `0`.
+### 🚨 **OEM-Grade Android Emergency Alert & Evacuation Layer (`com.argo.alert`)**
+*Direct-boot takeover, constant-time HMAC-SHA256 verification, offline metric radar routing, and dead-man rescue escalation.*
 
 ---
 
-## Project Structure
+[![Platform](https://img.shields.io/badge/Platform-Android_8.0%2B_(API_26--34)-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://developer.android.com/)
+[![Kotlin](https://img.shields.io/badge/Kotlin-2.0.20-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)](https://kotlinlang.org/)
+[![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack_Compose-4285F4?style=for-the-badge&logo=jetpackcompose&logoColor=white)](https://developer.android.com/jetpack/compose)
+[![Security](https://img.shields.io/badge/Crypto-HMAC--SHA256-FF3B30?style=for-the-badge&logo=lock&logoColor=white)](#-cryptographic-verification-pipeline)
+[![Dependencies](https://img.shields.io/badge/3P_SDKs-Zero_(Pure_Android)-0F172A?style=for-the-badge)](#%EF%B8%8F-architecture--source-map)
 
-```text
-app/src/main/
-├── AndroidManifest.xml                      # directBootAware components, specialUse FGS, emergency permissions
-├── res/
-│   ├── values/
-│   │   ├── strings.xml                      # App label and notification channel names
-│   │   └── themes.xml                       # Fullscreen dark emergency theme with cutout support
-│   └── xml/
-│       ├── device_admin_receiver.xml        # DeviceAdminReceiver policy metadata
-│       └── network_security_config.xml      # Scopes cleartext HTTP strictly to 10.0.2.2
-└── java/com/argo/alert/
-    ├── AdminReceiver.kt                     # DeviceAdminReceiver whitelisting LockTask mode
-    ├── AlertActivity.kt                     # Compose UI (Screen 1 takeover + Screen 2 map, protocols, check-in)
-    ├── AlertModels.kt                       # Data classes & org.json parsers for poll and payload JSON
-    ├── AlertService.kt                      # Foreground service: 2s polling, WakeLock, 6-gate pipeline
-    ├── AlertStateHolder.kt                  # Thread-safe StateFlow store shared between service and UI
-    ├── BootReceiver.kt                      # LOCKED_BOOT_COMPLETED & BOOT_COMPLETED receiver
-    ├── CryptoAndGeo.kt                      # HMAC-SHA256 verification, Haversine distance, nearest shelter
-    ├── DeviceTelemetry.kt                   # LocationManager GPS/Network arbitration & BatteryManager reader
-    ├── EventClient.kt                       # HttpURLConnection client for /api/device/poll & /api/device/event
-    ├── MainActivity.kt                      # Diagnostic launcher for permissions, Device Owner status & service start
-    └── SirenController.kt                   # AudioTrack dual-tone USAGE_ALARM synthesizer & vibrator controller
+[📌 Overview](#-overview) • [⚡ Core Capabilities](#-core-capabilities) • [🔐 Verification Pipeline](#-cryptographic-verification-pipeline) • [🔄 Evacuation State Machine](#-evacuation-state-machine) • [🏗️ Architecture](#%EF%B8%8F-architecture--source-map) • [🚀 Getting Started](#-getting-started) • [📡 Wire Contract](#-backend-wire-contract)
+
+</div>
+
+---
+
+## 📌 Overview
+
+**Argo Alert** (`com.argo.alert`) is a native **Kotlin + Jetpack Compose** emergency life-safety layer built with **zero third-party runtime dependencies**. Instead of relying on passive push notifications that get buried, silenced by Do Not Disturb, or blocked by Google Play Services outages, Argo Alert operates directly on core Android platform APIs (`Service`, `DevicePolicyManager`, `LocationManager`, `AudioTrack`, `javax.crypto`, and `HttpURLConnection`).
+
+When a cryptographically signed, geofenced disaster alert arrives, the app:
+1. 🔓 **Wakes the screen and overrides the lock screen & DND** in kiosk lock-task mode.
+2. 🔊 **Drives a dual-tone `960 Hz / 720 Hz` hardware alarm siren** with accessibility vibration and flashing red visuals.
+3. 🧭 **Projects the nearest relief shelters** onto a zero-network `cos(lat)` metric Canvas map with disaster-specific instructions.
+4. ⏱️ **Runs a dead-man's check-in countdown** that automatically escalates GPS telemetry to rescue dispatch if the user stops responding.
+
+---
+
+## ⚡ Core Capabilities
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🛑 Zero-Compromise Device Takeover
+- 🔋 **Direct-Boot Aware**: Launches via `LOCKED_BOOT_COMPLETED` (`directBootAware="true"`) before the user unlocks their phone.
+- 🔒 **Lock-Task Kiosk Mode**: Uses `AdminReceiver` (`DeviceAdminReceiver`) to whitelist `com.argo.alert` for `startLockTask()`, blocking accidental dismissal.
+- 💡 **Lock Screen & Overlay Bypass**: Wakes display (`turnScreenOn`), renders over keyguard (`showWhenLocked`), and includes a `FullScreenIntent` notification fallback.
+- ⚡ **5% Reserve Power Mode**: Detects `BatteryManager` levels `<= 5%` and emits `RESERVE_POWER_ACTIVE` while preserving alert delivery.
+
+</td>
+<td width="50%" valign="top">
+
+### 🔊 Hardware Siren & Accessibility
+- 🎵 **Synthesized `USAGE_ALARM` Siren**: `SirenController` generates an alternating **960 Hz / 720 Hz** tone (400 ms half-cycle) directly via `AudioTrack`.
+- 📢 **Volume Override**: Automatically raises the system alarm stream to maximum on takeover, then steps down to quiet (`20%`) or paused mode during evacuation.
+- 📳 **Tactile & Visual Alerts**: Paired repeating `VibrationEffect` patterns and high-contrast flashing red Screen 1 UI for deaf / hard-of-hearing accessibility.
+- 📞 **One-Tap `112` Dialer**: Direct `Intent.ACTION_DIAL` emergency button (`tel:112`) accessible over the lock screen.
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### 🧭 Offline Radar & Shelter Guidance
+- 🛰️ **Pure `LocationManager` GPS**: Arbitrates `GPS_PROVIDER` and `NETWORK_PROVIDER` fixes without Google Play Services, rejecting invalid `(0.0, 0.0)` fixes.
+- 📐 **Isotropic Metric Canvas Map**: Custom Jetpack Compose `Canvas` projection with `cos(lat)` scaling, scale bar, North indicator, and zero map-tile dependencies.
+- 🏥 **Nearest Shelter Vector**: Uses spherical Haversine math to highlight the closest shelter and draw the evacuation bearing/walking path.
+
+</td>
+<td width="50%" valign="top">
+
+### ⏱️ Dead-Man Check-In & Auto-SOS
+- 🔄 **Animated Countdown Ring**: Large circular **CHECK-IN** control in Screen 2 with color-coded urgency (`Green → Amber < 10s → Red`).
+- 🔔 **Low-Timer Chirp**: Re-engages quiet siren prompts when less than 10 seconds remain.
+- 🆘 **Automatic Rescue Escalation**: If the countdown reaches `0s`, broadcasts `ESCALATED` with live GPS coordinates to the control room.
+- ✅ **Signed Release**: Device only returns to standby upon receiving an HMAC-signed `ALL_CLEAR` token.
+
+</td>
+</tr>
+</table>
+
+---
+
+## 🔐 Cryptographic Verification Pipeline
+
+Every payload polled from `GET /api/device/poll` passes through **6 deterministic gates** inside `AlertService.kt` before any takeover occurs:
+
+```mermaid
+flowchart LR
+    GW["📡 Alert Gateway<br/>10.0.2.2:8000"] -->|"1. Poll every 2s"| SRV["⚙️ AlertService.kt<br/>ALERT_RECEIVED"]
+    SRV --> SIG{"2. HMAC-SHA256<br/>MessageDigest.isEqual"}
+    SIG -->|"❌ Invalid"| FAIL["🛡️ Drop Payload<br/>SIGNATURE_FAIL"]
+    SIG -->|"✅ Valid"| GEO{"3. Haversine Geofence<br/>dist ≤ radius_km?"}
+    GEO -->|"❌ Outside / No GPS"| OUT["📍 Ignore Alert<br/>OUT_OF_REGION"]
+    GEO -->|"✅ Inside Zone"| BAT{"4. Battery ≤ 5%?"}
+    BAT -->|"Yes"| RES["🪫 Log RESERVE_POWER_ACTIVE"]
+    BAT -->|"No"| WAKE
+    RES --> WAKE["🚨 5. SIREN_ON<br/>Launch AlertActivity"]
 ```
 
 ---
 
-## Requirements
+## 🔄 Evacuation State Machine
 
-- **Android Studio**: Iguana / Koala or newer (AGP `8.5.2`, Kotlin `2.0.20`, Compose BOM `2024.09.03`)
-- **JDK**: Java `17`
-- **Android SDK**: `minSdk = 26` (Android 8.0), `targetSdk = 34` (Android 14)
-- **Gateway Server**: Companion HTTP server listening on port `8000` (`http://10.0.2.2:8000` from the Android Emulator)
+```mermaid
+stateDiagram-v2
+    [*] --> Standby: Boot / AlertService Polling (2s)
+    Standby --> Screen1_Takeover: Verified In-Region Alert (SIREN_ON)
+
+    state Screen1_Takeover {
+        [*] --> FlashingRedAlert: 960/720 Hz Full Siren
+        FlashingRedAlert --> EmergencyCall: Tap "Emergency call 112"
+        FlashingRedAlert --> SlideUnlocked: Slide to Evacuate
+    }
+
+    Screen1_Takeover --> Screen2_Evacuation: SLIDER_CONFIRMED + NEAREST_SHELTER
+
+    state Screen2_Evacuation {
+        [*] --> GuidanceActive: Quiet Siren + Metric Radar
+        GuidanceActive --> CheckInReset: Tap CHECK-IN (Siren Paused)
+        CheckInReset --> LowTimerWarning: Remaining < 10s (Quiet Chirp)
+        LowTimerWarning --> CheckInReset: Tap CHECK-IN
+        LowTimerWarning --> EscalatedSOS: Timer Hits 0s (ESCALATED)
+        EscalatedSOS --> CheckInReset: Late Check-In
+    }
+
+    Screen1_Takeover --> Standby: Signed ALL_CLEAR
+    Screen2_Evacuation --> Standby: Signed ALL_CLEAR
+```
 
 ---
 
-## Getting Started
+## 🏗️ Architecture & Source Map
 
-### 1. Build & Install Debug APK
+```text
+app/src/main/
+├── 📄 AndroidManifest.xml                     # directBootAware, specialUse FGS, emergency permissions
+├── 📁 res/
+│   ├── 📁 values/
+│   │   ├── strings.xml                        # App label ("Argo Alert") & notification channel names
+│   │   └── themes.xml                         # Fullscreen dark emergency theme + cutout support
+│   └── 📁 xml/
+│       ├── device_admin_receiver.xml          # DeviceAdminReceiver lock-task policy metadata
+│       └── network_security_config.xml        # Cleartext HTTP scoped strictly to 10.0.2.2
+└── 📁 java/com/argo/alert/
+    ├── 🛡️ AdminReceiver.kt                   # Device Owner LockTask whitelisting
+    ├── 🚨 AlertActivity.kt                   # Compose Screen 1 takeover + Screen 2 map, protocols & check-in
+    ├── 📦 AlertModels.kt                     # Domain models & org.json parsers for poll & alert payloads
+    ├── ⚙️ AlertService.kt                    # START_STICKY FGS: 2s polling, WakeLock & 6-gate pipeline
+    ├── 🔄 AlertStateHolder.kt                # Thread-safe StateFlow store syncing service & Compose UI
+    ├── 🔌 BootReceiver.kt                    # LOCKED_BOOT_COMPLETED & BOOT_COMPLETED auto-start
+    ├── 🔐 CryptoAndGeo.kt                    # Constant-time HMAC-SHA256, Haversine & nearest shelter
+    ├── 📍 DeviceTelemetry.kt                 # LocationManager arbitration & BatteryManager level reader
+    ├── 🌐 EventClient.kt                     # Zero-dep HttpURLConnection client (/poll & /event)
+    ├── 📱 MainActivity.kt                    # Diagnostic setup screen (permissions, Device Owner, service)
+    └── 🔊 SirenController.kt                 # AudioTrack 960/720 Hz USAGE_ALARM & Vibrator controller
+```
 
+---
+
+## ⚙️ Tech Stack & Requirements
+
+| Component | Specification |
+| :--- | :--- |
+| **Language & UI** | Kotlin `2.0.20` · Jetpack Compose BOM `2024.09.03` · Material 3 |
+| **Build System** | Android Gradle Plugin `8.5.2` · JDK `17` |
+| **SDK Targets** | `minSdk = 26` (Android 8.0 Oreo) · `targetSdk = 34` (Android 14) |
+| **External Libraries** | **None** — 100% Android Framework & Java Standard Library |
+| **Companion Gateway** | HTTP Server on port `8000` (`http://10.0.2.2:8000` on Android Emulator) |
+
+---
+
+## 🚀 Getting Started
+
+### 1️⃣ Build & Install Debug APK
 ```bash
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-### 2. Provision Device Owner (Enables Lock-Task Kiosk Mode)
-
-Run on a fresh Android emulator or device with no signed-in accounts so `startLockTask()` pins `AlertActivity` without user confirmation:
-
+### 2️⃣ Provision Device Owner *(Optional — Enables Seamless Kiosk Lock-Task)*
+Run on a fresh emulator or device with no signed-in accounts so `startLockTask()` pins `AlertActivity` without confirmation:
 ```bash
 adb shell dpm set-device-owner com.argo.alert/.AdminReceiver
 ```
 
-### 3. Grant Runtime Permissions & Inject Mock GPS
-
+### 3️⃣ Grant Runtime Permissions & Inject Mock GPS
 ```bash
 adb shell pm grant com.argo.alert android.permission.ACCESS_FINE_LOCATION
 adb shell pm grant com.argo.alert android.permission.ACCESS_COARSE_LOCATION
 adb shell pm grant com.argo.alert android.permission.POST_NOTIFICATIONS
 adb shell appops set com.argo.alert SYSTEM_ALERT_WINDOW allow
 
-# Inject a GPS fix (longitude latitude)
+# Inject a GPS coordinate into LocationManager (longitude latitude)
 adb emu geo fix 139.7671 35.6812
 ```
 
-### 4. Test Direct Boot & 5% Reserve Battery Mode
-
+### 4️⃣ Test Direct Boot & 5% Reserved Battery Mode
 ```bash
 adb shell dumpsys battery set level 4
 adb reboot
@@ -95,16 +206,16 @@ adb reboot
 
 ---
 
-## Verification Pipeline & Backend Wire Contract
+## 📡 Backend Wire Contract
 
-`AlertService` polls the gateway every 2 seconds and reports ordered lifecycle events back to the server:
-
-### Poll Request
+### 🔹 Poll Endpoint *(Every 2 Seconds)*
 ```http
 GET /api/device/poll?device=emu1&lat=<lat>&lon=<lon>&battery=<pct>&src=gps
 ```
 
-**Active Alert Response:**
+<details>
+<summary><b>📥 Active Alert JSON Response</b></summary>
+
 ```json
 {
   "status": "ACTIVE",
@@ -113,7 +224,11 @@ GET /api/device/poll?device=emu1&lat=<lat>&lon=<lon>&battery=<pct>&src=gps
 }
 ```
 
-**Signed All-Clear Response:**
+</details>
+
+<details>
+<summary><b>🟢 Signed All-Clear JSON Response</b></summary>
+
 ```json
 {
   "status": "CLEARED",
@@ -122,7 +237,9 @@ GET /api/device/poll?device=emu1&lat=<lat>&lon=<lon>&battery=<pct>&src=gps
 }
 ```
 
-### Event Reporting
+</details>
+
+### 🔹 Event Telemetry Endpoint
 ```http
 POST /api/device/event
 Content-Type: application/json
@@ -137,19 +254,18 @@ Content-Type: application/json
 }
 ```
 
-**Emitted Event Sequence:**
-1. `ALERT_RECEIVED` — Payload received and deduplicated
-2. `SIGNATURE_OK` / `SIGNATURE_FAIL` — Constant-time HMAC-SHA256 verification
-3. `IN_REGION` / `OUT_OF_REGION` — Haversine geofence check against `region.radius_km`
-4. `RESERVE_POWER_ACTIVE` — Emitted if battery is `<= 5%`
-5. `SIREN_ON` — Screen 1 lock-screen takeover & `USAGE_ALARM` siren started
-6. `SLIDER_CONFIRMED` & `NEAREST_SHELTER` — User slid to evacuate; Screen 2 routing active
-7. `CHECKIN` / `ESCALATED` — Check-in reset or missed-timer rescue escalation
-8. `ALL_CLEAR` — Signed clear token verified and device released
+**Ordered Lifecycle Events:**
+`ALERT_RECEIVED` → `SIGNATURE_OK` / `SIGNATURE_FAIL` → `IN_REGION` / `OUT_OF_REGION` → `RESERVE_POWER_ACTIVE` → `SIREN_ON` → `SLIDER_CONFIRMED` → `NEAREST_SHELTER` → `CHECKIN` / `ESCALATED` → `ALL_CLEAR`
 
 ---
 
-## Security Notes
+## 🛡️ Security Notes
 
-- The demo shared secret (`argo-demo-shared-secret` in `CryptoAndGeo.kt`) is for local simulation only. Production deployments should replace symmetric HMAC keys with asymmetric signatures backed by Android Keystore / hardware-protected OEM trust anchors.
-- `network_security_config.xml` explicitly restricts cleartext HTTP traffic to `10.0.2.2`; production endpoints must enforce HTTPS.
+- 🔑 **Demo Key Warning**: `CryptoAndGeo.SHARED_SECRET` (`argo-demo-shared-secret`) is strictly for local simulator testing. Production OEM builds should use asymmetric signatures backed by Android Keystore / hardware-protected trust anchors.
+- 🌐 **Transport Security**: `network_security_config.xml` explicitly scopes cleartext HTTP exclusively to `10.0.2.2`; production deployments must enforce TLS (`https://`).
+
+---
+
+<div align="center">
+<b>Argo Alert (<code>com.argo.alert</code>)</b> — <i>Built with pure Kotlin &amp; Jetpack Compose for resilient life-safety response.</i>
+</div>
