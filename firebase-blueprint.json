@@ -1,0 +1,165 @@
+{
+  "entities": {
+    "ChannelAlert": {
+      "title": "ChannelAlert",
+      "description": "Signed emergency alert state for an Argo Navis gateway channel.",
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Gateway channel identifier shared between the Python server and Android devices."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["NONE", "ACTIVE", "CLEARED"],
+          "maxLength": 16,
+          "description": "Current alert lifecycle state."
+        },
+        "payload": {
+          "type": "string",
+          "maxLength": 65536,
+          "description": "Canonical JSON payload string verified by HMAC-SHA256 on devices."
+        },
+        "sig": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "HMAC-SHA256 hex signature over payload."
+        },
+        "clear_sig": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "HMAC-SHA256 hex signature over alert_id|CLEARED."
+        },
+        "alg": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Signature algorithm identifier."
+        },
+        "alert_id": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Short unique alert identifier."
+        },
+        "updated_at": {
+          "type": "number",
+          "description": "Server Unix timestamp in seconds."
+        }
+      },
+      "required": ["channel_id", "status", "payload", "sig", "clear_sig", "alg", "alert_id", "updated_at"]
+    },
+    "DeviceTelemetryDoc": {
+      "title": "DeviceTelemetryDoc",
+      "description": "Live telemetry and evacuation status reported by an Android emergency device.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Device identifier."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["IDLE", "ALERTED", "EVACUATING", "CHECKED_IN", "ESCALATED"],
+          "maxLength": 24,
+          "description": "Current evacuation status."
+        },
+        "lat": {
+          "type": "number",
+          "description": "Latitude in decimal degrees."
+        },
+        "lon": {
+          "type": "number",
+          "description": "Longitude in decimal degrees."
+        },
+        "has_fix": {
+          "type": "boolean",
+          "description": "True if lat/lon represent a valid telemetry coordinate."
+        },
+        "battery": {
+          "type": "number",
+          "description": "Battery percentage 0..100."
+        },
+        "src": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Location provider source (gps, network, mock, none)."
+        },
+        "last_seen": {
+          "type": "number",
+          "description": "Unix timestamp in seconds when device last polled."
+        },
+        "deadline": {
+          "type": "number",
+          "description": "Unix timestamp in seconds for next check-in deadline, or 0 if none."
+        }
+      },
+      "required": ["id", "status", "lat", "lon", "has_fix", "battery", "src", "last_seen", "deadline"]
+    },
+    "DeviceEventDoc": {
+      "title": "DeviceEventDoc",
+      "description": "Audit log event emitted by a device or gateway on an emergency channel.",
+      "type": "object",
+      "properties": {
+        "ts": {
+          "type": "number",
+          "description": "Unix timestamp in seconds."
+        },
+        "device": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Device or gateway identifier."
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 48,
+          "pattern": "^[A-Z0-9_]+$",
+          "description": "Event type code."
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Human-readable event detail."
+        },
+        "lat": {
+          "type": "number",
+          "description": "Latitude in decimal degrees."
+        },
+        "lon": {
+          "type": "number",
+          "description": "Longitude in decimal degrees."
+        },
+        "has_coords": {
+          "type": "boolean",
+          "description": "True if lat/lon are valid coordinates."
+        },
+        "interval_s": {
+          "type": "number",
+          "description": "Check-in interval in seconds, or 0 if not applicable."
+        }
+      },
+      "required": ["ts", "device", "kind", "detail", "lat", "lon", "has_coords", "interval_s"]
+    }
+  },
+  "firestore": {
+    "/channels/{channelId}": {
+      "schema": "ChannelAlert",
+      "description": "Active or cleared signed alert state for a specific Argo Navis gateway channel."
+    },
+    "/channels/{channelId}/devices/{deviceId}": {
+      "schema": "DeviceTelemetryDoc",
+      "description": "Registered devices and live telemetry on the channel."
+    },
+    "/channels/{channelId}/events/{eventId}": {
+      "schema": "DeviceEventDoc",
+      "description": "Chronological emergency lifecycle events on the channel."
+    }
+  }
+}

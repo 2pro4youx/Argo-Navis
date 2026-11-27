@@ -1,0 +1,93 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidChannelId(id) {
+      return id is string && id.size() >= 4 && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidChannelAlert(data, channelId) {
+      return data.keys().hasAll(['channel_id', 'status', 'payload', 'sig', 'clear_sig', 'alg', 'alert_id', 'updated_at'])
+        && data.keys().hasOnly(['channel_id', 'status', 'payload', 'sig', 'clear_sig', 'alg', 'alert_id', 'updated_at'])
+        && data.channel_id is string && data.channel_id == channelId && data.channel_id.size() <= 64
+        && data.status is string && data.status in ['NONE', 'ACTIVE', 'CLEARED'] && data.status.size() <= 16
+        && data.payload is string && data.payload.size() <= 131072
+        && data.sig is string && data.sig.size() <= 128
+        && data.clear_sig is string && data.clear_sig.size() <= 128
+        && data.alg is string && data.alg.size() <= 32
+        && data.alert_id is string && data.alert_id.size() <= 64
+        && (data.updated_at is int || data.updated_at is float);
+    }
+
+    function isValidDeviceTelemetry(data, deviceId) {
+      return data.keys().hasAll(['id', 'status', 'lat', 'lon', 'has_fix', 'battery', 'src', 'last_seen', 'deadline'])
+        && data.keys().hasOnly(['id', 'status', 'lat', 'lon', 'has_fix', 'battery', 'src', 'last_seen', 'deadline'])
+        && data.id is string && data.id == deviceId && data.id.size() <= 64
+        && data.status is string && data.status in ['IDLE', 'ALERTED', 'EVACUATING', 'CHECKED_IN', 'ESCALATED'] && data.status.size() <= 24
+        && (data.lat is int || data.lat is float) && data.lat >= -90 && data.lat <= 90
+        && (data.lon is int || data.lon is float) && data.lon >= -180 && data.lon <= 180
+        && data.has_fix is bool
+        && (data.battery is int || data.battery is float) && data.battery >= 0 && data.battery <= 100
+        && data.src is string && data.src.size() <= 32
+        && (data.last_seen is int || data.last_seen is float)
+        && (data.deadline is int || data.deadline is float);
+    }
+
+    function isValidDeviceEvent(data) {
+      return data.keys().hasAll(['ts', 'device', 'kind', 'detail', 'lat', 'lon', 'has_coords', 'interval_s'])
+        && data.keys().hasOnly(['ts', 'device', 'kind', 'detail', 'lat', 'lon', 'has_coords', 'interval_s'])
+        && (data.ts is int || data.ts is float)
+        && data.device is string && data.device.size() >= 1 && data.device.size() <= 64 && data.device.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.kind is string && data.kind.size() >= 1 && data.kind.size() <= 48 && data.kind.matches('^[A-Z0-9_]+$')
+        && data.detail is string && data.detail.size() <= 512
+        && (data.lat is int || data.lat is float) && data.lat >= -90 && data.lat <= 90
+        && (data.lon is int || data.lon is float) && data.lon >= -180 && data.lon <= 180
+        && data.has_coords is bool
+        && (data.interval_s is int || data.interval_s is float) && data.interval_s >= 0 && data.interval_s <= 86400;
+    }
+
+    match /channels/{channelId} {
+      allow get: if isValidChannelId(channelId);
+      allow list: if false;
+      allow create: if isValidChannelId(channelId) && isValidChannelAlert(incoming(), channelId);
+      allow update: if isValidChannelId(channelId)
+        && isValidChannelAlert(incoming(), channelId)
+        && incoming().channel_id == existing().channel_id
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'payload', 'sig', 'clear_sig', 'alg', 'alert_id', 'updated_at']);
+      allow delete: if false;
+
+      match /devices/{deviceId} {
+        allow get, list: if isValidChannelId(channelId);
+        allow create: if isValidChannelId(channelId) && isValidId(deviceId) && isValidDeviceTelemetry(incoming(), deviceId);
+        allow update: if isValidChannelId(channelId)
+          && isValidId(deviceId)
+          && isValidDeviceTelemetry(incoming(), deviceId)
+          && incoming().id == existing().id
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'lat', 'lon', 'has_fix', 'battery', 'src', 'last_seen', 'deadline']);
+        allow delete: if isValidChannelId(channelId) && isValidId(deviceId);
+      }
+
+      match /events/{eventId} {
+        allow get, list: if isValidChannelId(channelId);
+        allow create: if isValidChannelId(channelId) && isValidId(eventId) && isValidDeviceEvent(incoming());
+        allow update: if false;
+        allow delete: if isValidChannelId(channelId) && isValidId(eventId);
+      }
+    }
+  }
+}

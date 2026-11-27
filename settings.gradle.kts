@@ -22,6 +22,3 @@ dependencyResolutionManagement {
 
 rootProject.name = "ArgoAlert"
 include(":app")
-include(":app")
-include(":app")
- 

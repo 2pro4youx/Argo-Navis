@@ -42,6 +42,17 @@ data class PollResponse(
     val clearSig: String?,
 )
 
+enum class TransportMode(val label: String, val storageKey: String) {
+    DUAL("Both (FB+IP)", "dual"),
+    FIREBASE("Firebase", "firebase"),
+    HTTP_IP("Direct IP", "http");
+
+    companion object {
+        fun fromKey(raw: String?): TransportMode =
+            entries.firstOrNull { it.storageKey.equals(raw, ignoreCase = true) } ?: DUAL
+    }
+}
+
 object AlertJsonParser {
 
     /**

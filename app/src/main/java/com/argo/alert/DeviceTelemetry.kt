@@ -46,6 +46,7 @@ class DeviceTelemetry(private val context: Context) {
     }
 
     private fun acceptFix(location: Location, fixAtMs: Long) {
+        if (location.latitude == 0.0 && location.longitude == 0.0) return
         val provider = location.provider ?: LocationManager.GPS_PROVIDER
         // A coarse network fix must not overwrite a GPS fix that arrived in the last 10 seconds.
         if (provider == LocationManager.NETWORK_PROVIDER &&
@@ -59,16 +60,26 @@ class DeviceTelemetry(private val context: Context) {
         fixElapsedMs = fixAtMs
         fixProvider = provider
         if (AlertStateHolder.state.value.mockLocationOverride == null) {
-            AlertStateHolder.updateLocation(latestLocation)
+            AlertStateHolder.updateLocation(latestLocation, locationSource())
         }
     }
 
-    private fun hasFinePermission(): Boolean =
+    private fun hasLocationPermission(): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
 
-    fun startLocationUpdates() {
-        if (listening || !hasFinePermission()) return
+    fun startLocationUpdates(forceRefresh: Boolean = false) {
+        if (!hasLocationPermission()) return
+        if (listening && !forceRefresh) {
+            runCatching { refreshFromLastKnown() }
+            return
+        }
+        if (listening) {
+            runCatching { locationManager.removeUpdates(locationListener) }
+            listening = false
+        }
         runCatching { refreshFromLastKnown() }
         // GPS gives the exact position; the network provider gives a fast rough fix indoors.
         for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
@@ -104,7 +115,7 @@ class DeviceTelemetry(private val context: Context) {
     fun getCurrentLocation(): GeoPoint {
         val override = AlertStateHolder.state.value.mockLocationOverride
         if (override != null) return override
-        if (hasFinePermission()) {
+        if (hasLocationPermission()) {
             runCatching { refreshFromLastKnown() }
         }
         return latestLocation
