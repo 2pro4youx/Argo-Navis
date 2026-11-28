@@ -251,6 +251,28 @@ The long-term vision of **ArgoNavis** is to transcend standard user-installed ap
    * **Minimal Energy Flow to GPS & Trigger Subsystems**: Minimal power continues to trickle to the GNSS/GPS baseband receiver, low-power broadcast radio (Cell Broadcast / FM / Satellite alert listener), and the emergency audio amplifier.
    * **Life-Saving Alarms on "Dead" Phones**: If a catastrophic earthquake, cyclone, flash flood, or tsunami occurs while the phone is ostensibly "powered off" or dead, the ArgoNavis hardware interrupt wakes the critical alarm circuit, sounds the evacuation siren, powers on high-contrast guidance, and broadcasts rescue coordinates—ensuring that citizens are alerted and rescued even when they thought their phone had no battery remaining.
 
+3. **Tamper-Proof Defense Against Intercepted & Spoofed Satellite Signals**:
+   * **Asymmetric Hardware Root-of-Trust (No Shared Keys on Phone)**: While the prototype uses symmetric HMAC-SHA256 for rapid demonstration, the OEM/bootloader edition stores only the national authority's **immutable public verification key** inside silicon fuses / Trusted Execution Environment (**TEE / StrongBox / ARM TrustZone**). Even if an attacker intercepts satellite or cell-broadcast frames or dumps flash storage from a lost device, they never possess the private signing key needed to forge alerts, tamper with shelter coordinates, or inject a fake `ALL-CLEAR`.
+   * **Signed, Time-Bounded & Replay-Proof Signal Envelopes**: Every downward alert transmitted over **Non-Terrestrial Satellite Networks (NTN), L-band emergency beams, or Cell Broadcast** is wrapped in a cryptographically signed envelope binding a **monotonic sequence counter, UTC validity window, and signed geofence bounds**. If a hostile actor records and rebroadcasts (replays) a captured satellite alert or attempts man-in-the-middle signal injection, the baseband verifier immediately drops it before waking the UI.
+   * **Multi-Constellation GNSS & RF Cross-Verification**: To counter localized satellite/GPS spoofing transmitters attempting to misdirect citizens toward hazard zones, the emergency firmware cross-checks orbital ephemeris, multi-band GNSS timing deltas, and passive terrestrial tower/anchor signatures before trusting a sudden coordinate jump.
+   * **Verified Boot & Immutable Emergency Partition**: Android Verified Boot (`AVB`) and hardware rollback protection lock the ArgoNavis emergency partition and local shelter verification logic—ensuring malicious apps, rooted OS exploits, or rogue updates cannot silence alarms or tamper with evacuation routing.
+
+4. **Protecting Citizen Data From Theft & Satellite Signal Interception (Zero-Leakage Privacy)**:
+   * **Strictly One-Way Receive-Only Downlink (Zero Passive Footprints)**: Emergency alerts pushed over satellite or terrestrial broadcast operate as **anonymous, one-way envelopes**. The phone verifies signatures and checks *"am I inside this disaster polygon?"* **100% locally on-device** without ever sending back GPS coordinates, phone numbers, IMEIs, or acknowledgments—meaning anyone passively sniffing satellite beams learns **nothing** about who is present in the region.
+   * **Silent Until Escalation (No Continuous Tracking)**: Under normal operation and active evacuation check-ins, location never leaves the hardware boundary. An uplink transmission is permitted **only** when a citizen misses their dead-man's check-in window and triggers automated rescue escalation.
+   * **Ephemeral, Asymmetric End-to-End Uplink Sealing**: When an SOS distress packet is transmitted back over satellite uplink or cellular fallback, the device seals `{coordinates, battery_reserve, status}` inside the TEE using a **single-use ephemeral ECDH session key** pinned to the rescue command center's public encryption key, paired with a rotating **unlinkable session token** instead of raw identity markers (IMEI/IMSI/phone number). Any adversary intercepting the satellite uplink captures only forward-secret opaque ciphertext—protecting citizens' identities, daily movements, and personal metadata from surveillance or theft.
+   * **Data Minimization & Automatic Post-Crisis Purge**: Rescue command centers decrypt only the transient coordinates needed to dispatch aid, while hardware-enforced retention rules automatically purge ephemeral rescue tokens once the incident is cleared.
+
+```mermaid
+flowchart TB
+    SAT["🛰️ Satellite / Cell Broadcast\n(Signed Alert Envelope + Nonce + Geofence)"] -->|"1-Way Passive Reception\n(Zero Device Identity / GPS Leaked)"| TEE["🔒 Hardware TEE / Bootloader Verifier\nPinned Govt Public Key + Replay Check"]
+    TEE -->|"❌ Forged / Replayed / Spoofed Signal"| DROP["🛑 Dropped in Baseband Firmware"]
+    TEE -->|"✅ Authentic & Locally Verified In-Region"| EVAC["🚨 Siren, Local Shelter Route & Dead-Man Timer"]
+    EVAC -->|"User Checks In Safely"| LOCAL["🏠 Telemetry Stays 100% On-Device"]
+    EVAC -->|"Missed Check-In (SOS Only)"| SEAL["🛡️ Ephemeral ECDH + Sealed Rescue Token\n(Asymmetric Encryption · No Raw PII/IMEI)"]
+    SEAL -->|"Encrypted Uplink\n(Opaque to RF / Satellite Interceptors)"| RESCUE["🚑 Authorized Rescue Control Room"]
+```
+
 ---
 
 ## 📄 License

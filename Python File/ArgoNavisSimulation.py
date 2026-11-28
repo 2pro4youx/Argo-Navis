@@ -30,11 +30,13 @@ SECRET = b"argo-demo-shared-secret"  # DEMO ONLY. A real system uses asymmetric 
 DEFAULT_FIREBASE_URL = "https://argo-navis-ad84c-default-rtdb.asia-southeast1.firebasedatabase.app"
 FIREBASE_URL = os.environ.get("ARGO_FIREBASE_URL", DEFAULT_FIREBASE_URL).strip().rstrip("/")
 _SEEN_FB_EVENTS = set()
+_ENRICHED_LOCS = set()
 _FB_EPOCH = 0
 _FB_RESETTING = False
 OVERPASS_URLS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
-SHELTER_CACHE = Path("data/shelters_cache.json")
-ROUTE_CACHE = Path("data/routes_cache.json")
+BASE_DIR = Path(__file__).resolve().parent
+SHELTER_CACHE = BASE_DIR / "data" / "shelters_cache.json"
+ROUTE_CACHE = BASE_DIR / "data" / "routes_cache.json"
 # Free walking routes from the FOSSGIS OSRM demo server (OpenStreetMap data). Fair use: ~1 request/second.
 ROUTING_URL = "https://routing.openstreetmap.de/routed-foot/route/v1/foot/{lo1},{la1};{lo2},{la2}?overview=full&geometries=geojson"
 WALK_KMH = 5.0
@@ -138,15 +140,38 @@ def pick_shelters(elements, lat, lon, n=5, max_per_kind=2):
     return out
 
 
+def _with_distances(items, lat, lon):
+    out = []
+    for sh in items:
+        s = dict(sh)
+        s["distance_km"] = round(haversine_km(lat, lon, float(s["lat"]), float(s["lon"])), 2)
+        out.append(s)
+    out.sort(key=lambda x: x["distance_km"])
+    return out
+
+
+def _nearest_cached_shelters(cache, lat, lon, max_km=5.0):
+    best_key, best_d = None, max_km
+    for k in cache:
+        try:
+            k_lat, k_lon = (float(p) for p in k.split(",", 1))
+            d = haversine_km(lat, lon, k_lat, k_lon)
+            if d <= best_d:
+                best_key, best_d = k, d
+        except Exception:
+            continue
+    return _with_distances(cache[best_key], lat, lon) if best_key else None
+
+
 def find_shelters(lat, lon, n=5):
-    """Nearest real buildings. Cached on disk; falls back to demo shelters if offline."""
+    """Nearest real buildings. Cached on disk; falls back to nearby cache or demo shelters if offline."""
     key = f"{lat:.3f},{lon:.3f}"
     try:
         cache = json.loads(SHELTER_CACHE.read_text())
     except Exception:
         cache = {}
     if key in cache:
-        return cache[key], "OpenStreetMap (cached)"
+        return _with_distances(cache[key], lat, lon), "OpenStreetMap (cached)"
     try:
         found = []
         for radius in (2500, 6000, 15000):
@@ -160,6 +185,9 @@ def find_shelters(lat, lon, n=5):
         SHELTER_CACHE.write_text(json.dumps(cache, indent=1))
         return found, "OpenStreetMap"
     except Exception as e:
+        nearby = _nearest_cached_shelters(cache, lat, lon, max_km=5.0)
+        if nearby:
+            return nearby, "OpenStreetMap (nearby cache)"
         print(f"[shelters] lookup failed ({e}); using demo shelters", flush=True)
         return _demo_shelters(lat, lon), "DEMO shelters (offline fallback)"
 
@@ -210,6 +238,121 @@ def attach_routes(center, shelters, max_n=3):
         ROUTE_CACHE.parent.mkdir(parents=True, exist_ok=True)
         ROUTE_CACHE.write_text(json.dumps(cache))
     return out
+
+
+def _merge_shelters(*shelter_lists):
+    merged = []
+    index_by_key = {}
+    for slist in shelter_lists:
+        for raw in slist:
+            sh = dict(raw)
+            coord_key = (round(float(sh["lat"]), 4), round(float(sh["lon"]), 4))
+            name_key = sh.get("name", "").strip().lower()
+            existing_idx = index_by_key.get(coord_key)
+            if existing_idx is None and name_key:
+                existing_idx = index_by_key.get(name_key)
+            if existing_idx is None:
+                idx = len(merged)
+                merged.append(sh)
+                index_by_key[coord_key] = idx
+                if name_key:
+                    index_by_key[name_key] = idx
+            else:
+                if len(sh.get("route") or []) > len(merged[existing_idx].get("route") or []):
+                    merged[existing_idx] = sh
+    return merged
+
+
+def _collect_region_shelters(center, radius_km, devices):
+    """Collect shelters and walking routes for both in-region live devices and alert center."""
+    in_region = [
+        d for d in devices
+        if d.get("lat") is not None and d.get("lon") is not None and d.get("src") != "none"
+        and haversine_km(center[0], center[1], float(d["lat"]), float(d["lon"])) <= radius_km
+    ]
+    in_region.sort(key=lambda d: d.get("last_seen") or 0, reverse=True)
+
+    origins = []
+    for d in in_region:
+        pt = (float(d["lat"]), float(d["lon"]))
+        if all(haversine_km(pt[0], pt[1], o[0], o[1]) > 1.5 for o in origins):
+            origins.append(pt)
+        if len(origins) >= 4:
+            break
+
+    if all(haversine_km(center[0], center[1], o[0], o[1]) > 1.5 for o in origins):
+        origins.append((float(center[0]), float(center[1])))
+
+    all_lists = []
+    sources = []
+    for orig in origins:
+        found, src = find_shelters(orig[0], orig[1], n=5)
+        found = attach_routes(orig, found, max_n=3)
+        all_lists.append(found)
+        if src not in sources:
+            sources.append(src)
+
+    merged = _merge_shelters(*all_lists) if all_lists else _demo_shelters(*center)
+    return merged, " + ".join(sources) if sources else "demo"
+
+
+def _maybe_enrich_alert_for_device(dev_lat, dev_lon, src=None):
+    """If an in-region device has no shelter within 5 km in the active alert, enrich & re-sign."""
+    if dev_lat is None or dev_lon is None or src == "none":
+        return
+    try:
+        dlat, dlon = float(dev_lat), float(dev_lon)
+    except (TypeError, ValueError):
+        return
+    with LOCK:
+        alert = STATE["alert"]
+        if not alert or alert.get("status") != "ACTIVE" or not verify(alert):
+            return
+        try:
+            body = json.loads(alert["payload"])
+        except Exception:
+            return
+        r = body.get("region") or {}
+        rc = r.get("center") or [0, 0]
+        if haversine_km(dlat, dlon, rc[0], rc[1]) > float(r.get("radius_km", 0)):
+            return
+        existing = body.get("shelters") or []
+        if any(haversine_km(dlat, dlon, s["lat"], s["lon"]) <= 5.0 for s in existing):
+            return
+        aid = body.get("alert_id", "")
+        enrich_key = f"{aid}|{dlat:.2f},{dlon:.2f}"
+        if enrich_key in _ENRICHED_LOCS:
+            return
+        _ENRICHED_LOCS.add(enrich_key)
+
+    def _run():
+        found, src_label = find_shelters(dlat, dlon, n=5)
+        found = attach_routes((dlat, dlon), found, max_n=3)
+        alert_snapshot = None
+        with LOCK:
+            cur = STATE["alert"]
+            if not cur or cur.get("status") != "ACTIVE" or not verify(cur):
+                return
+            try:
+                cur_body = json.loads(cur["payload"])
+            except Exception:
+                return
+            if cur_body.get("alert_id") != aid:
+                return
+            cur_body["shelters"] = _merge_shelters(found, cur_body.get("shelters") or [])
+            prev_src = cur_body.get("shelter_source", "")
+            if src_label and src_label not in prev_src:
+                cur_body["shelter_source"] = f"{prev_src} + {src_label}".strip(" +")
+            payload = json.dumps(cur_body, sort_keys=True, separators=(",", ":"))
+            cur["payload"] = payload
+            cur["sig"] = sign(payload)
+            log_event("GATEWAY", "SHELTERS_ENRICHED",
+                      f"+{len(found)} local shelters near {dlat:.4f},{dlon:.4f} ({src_label})")
+            alert_snapshot = dict(cur)
+        if alert_snapshot:
+            _fb_push_alert_async(alert_snapshot)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def make_alert(place, atype, severity, radius_km, interval_s, forged=False,
@@ -335,6 +478,7 @@ def _fb_sync_loop():
                 epoch = _FB_EPOCH
             devs = _fb_request("devices.json")
             evts = _fb_request("events.json")
+            newly_updated = []
             with LOCK:
                 if _FB_RESETTING or epoch != _FB_EPOCH:
                     time.sleep(0.5)
@@ -352,12 +496,16 @@ def _fb_sync_loop():
                         )
                         if isinstance(info.get("last_seen"), (int, float)):
                             d["last_seen"] = info["last_seen"]
+                        if info.get("lat") is not None and info.get("lon") is not None:
+                            newly_updated.append((info.get("lat"), info.get("lon"), info.get("src")))
                 if isinstance(evts, dict):
                     for key, ev in sorted(evts.items()):
                         if key in _SEEN_FB_EVENTS or not isinstance(ev, dict):
                             continue
                         _SEEN_FB_EVENTS.add(key)
                         apply_event(ev)
+            for lat_v, lon_v, src_v in newly_updated:
+                _maybe_enrich_alert_for_device(lat_v, lon_v, src_v)
         except Exception as e:
             print(f"[firebase] poll error: {e}", flush=True)
         time.sleep(1.5)
@@ -392,18 +540,34 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(u.query)
         if u.path == "/":
             return self._send(HTML, ctype="text/html; charset=utf-8")
+        if u.path == "/api/shelters":
+            try:
+                lat = float(q["lat"][0])
+                lon = float(q["lon"][0])
+            except (KeyError, IndexError, TypeError, ValueError):
+                return self._send({"error": "lat and lon query params required"}, 400)
+            found, src = find_shelters(lat, lon, n=5)
+            found = attach_routes((lat, lon), found, max_n=3)
+            return self._send({"shelters": found, "source": src})
+        enrich_args = None
         with LOCK:
             if u.path == "/api/state":
                 return self._send(public_state())
             if u.path == "/api/device/poll":
                 f = lambda k: float(q[k][0]) if k in q else None
                 b = int(q["battery"][0]) if "battery" in q else None
-                touch_device(q.get("device", ["dev1"])[0], f("lat"), f("lon"), b, q.get("src", ["unknown"])[0])
-                return self._send({"alert": STATE["alert"], "server_time": time.time()})
+                lat_v, lon_v, src_v = f("lat"), f("lon"), q.get("src", ["unknown"])[0]
+                touch_device(q.get("device", ["dev1"])[0], lat_v, lon_v, b, src_v)
+                enrich_args = (lat_v, lon_v, src_v)
+                resp = {"alert": STATE["alert"], "server_time": time.time()}
+        if enrich_args is not None:
+            _maybe_enrich_alert_for_device(*enrich_args)
+            return self._send(resp)
         self._send({"error": "not found"}, 404)
 
     def _create_alert(self, data):
         try:
+            radius_km = float(data.get("radius_km", 15))
             if data.get("lat") not in (None, "") and data.get("lon") not in (None, ""):
                 center, place = (float(data["lat"]), float(data["lon"])), "your typed location"
             elif data.get("city", "LIVE") == "LIVE":
@@ -419,11 +583,31 @@ class Handler(BaseHTTPRequestHandler):
                 center, place = CITIES.get(city, CITIES["Bhopal"]), f"{city} region"
         except (TypeError, ValueError) as e:
             return self._send({"error": f"bad location: {e}"}, 400)
-        shelters, source = find_shelters(*center)  # network calls, deliberately outside LOCK
-        shelters = attach_routes(center, shelters)
+
         with LOCK:
+            devices_snapshot = [dict(d) for d in STATE["devices"].values()]
+        if FIREBASE_URL:
+            try:
+                fb_devs = _fb_request("devices.json")
+                if isinstance(fb_devs, dict):
+                    seen_ids = {d.get("id") for d in devices_snapshot}
+                    for dev_id, info in fb_devs.items():
+                        if isinstance(info, dict) and info.get("id", dev_id) not in seen_ids:
+                            devices_snapshot.append({
+                                "id": info.get("id", dev_id),
+                                "lat": info.get("lat"),
+                                "lon": info.get("lon"),
+                                "src": info.get("src", "-"),
+                                "last_seen": info.get("last_seen", 0),
+                            })
+            except Exception:
+                pass
+
+        shelters, source = _collect_region_shelters(center, radius_km, devices_snapshot)  # network calls outside LOCK
+        with LOCK:
+            _ENRICHED_LOCS.clear()
             STATE["alert"] = make_alert(place, data.get("type", "FLOOD"), data.get("severity", "WARNING"),
-                                        float(data.get("radius_km", 15)), int(data.get("checkin_interval_s", 600)),
+                                        radius_km, int(data.get("checkin_interval_s", 600)),
                                         bool(data.get("forged")), center, shelters, source)
             log_event("GATEWAY", "ALERT_SENT" + (" (FORGED)" if data.get("forged") else ""),
                       f"centre {center[0]:.5f},{center[1]:.5f}; shelters: {source}")
@@ -454,6 +638,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/reset":
                 STATE.update({"alert": None, "devices": {}, "events": []})
                 _SEEN_FB_EVENTS.clear()
+                _ENRICHED_LOCS.clear()
                 _FB_EPOCH += 1
                 do_reset = True
             else:
@@ -628,33 +813,51 @@ function initLeaflet(){
  try{$('lmap').style.display='block';LM=L.map('lmap').setView([23.26,77.41],14);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(LM);
   LG=L.layerGroup().addTo(LM);LM.invalidateSize();return true}catch(e){LM=null;return false}}
+const hav=(a,b,c,d)=>{const p=Math.PI/180,h=Math.sin((c-a)*p/2)**2+Math.cos(a*p)*Math.cos(c*p)*Math.sin((d-b)*p/2)**2;return 12742*Math.asin(Math.sqrt(Math.min(1,h)))};
 function renderLeaflet(s,B){
- LG.clearLayers();const pts=[];
+ LG.clearLayers();const pts=[],focusPts=[];
+ const activeDevs=s.devices.filter(d=>d.lat!=null&&d.lon!=null&&(!B||hav(d.lat,d.lon,B.region.center[0],B.region.center[1])<=B.region.radius_km));
+ const nearestByIdx=new Map();
+ if(B&&B.shelters.length){
+  if(activeDevs.length){
+   activeDevs.forEach(d=>{let bestI=-1,bestD=1e9;B.shelters.forEach((h,i)=>{const dist=hav(d.lat,d.lon,h.lat,h.lon);if(dist<bestD){bestD=dist;bestI=i}});if(bestI>=0)nearestByIdx.set(bestI,{dev:d,dist:bestD})});
+  }else{nearestByIdx.set(0,{dev:null,dist:null})}
+ }
  if(B){L.circle(B.region.center,{radius:B.region.radius_km*1000,color:'#ff3b3b',weight:2,dashArray:'6 4',fillOpacity:.07}).addTo(LG);
   B.shelters.forEach((h,i)=>{
-   if(h.route&&h.route.length>1)L.polyline(h.route,{color:i==0?'#1e90ff':'#6b7785',weight:i==0?5:3,opacity:.9}).addTo(LG);
-   const info=h.route_km?` - ${h.route_km} km, ~${h.route_min} min walk`:` - ${h.distance_km??'?'} km`;
-   L.circleMarker([h.lat,h.lon],{radius:8,color:'#fff',weight:2,fillColor:'#3ddc97',fillOpacity:1}).bindTooltip(esc(h.name)+info,{permanent:i==0,direction:'right'}).addTo(LG);
-   pts.push([h.lat,h.lon])})}
+   const match=nearestByIdx.get(i),isPrimary=Boolean(match);
+   const dev=match&&match.dev;
+   const routeValid=h.route&&h.route.length>1&&(!dev||hav(dev.lat,dev.lon,h.route[0][0],h.route[0][1])<=1.5);
+   if(routeValid)L.polyline(h.route,{color:isPrimary?'#1e90ff':'#6b7785',weight:isPrimary?5:2,opacity:isPrimary?.9:.45}).addTo(LG);
+   else if(isPrimary&&dev)L.polyline([[dev.lat,dev.lon],[h.lat,h.lon]],{color:'#1e90ff',weight:4,dashArray:'8 6',opacity:.85}).addTo(LG);
+   const distLabel=(match&&match.dist!=null)?match.dist.toFixed(2)+' km from '+esc(match.dev.id):(h.distance_km??'?')+' km';
+   const info=routeValid&&h.route_km?` - ${h.route_km} km, ~${h.route_min} min walk`:` - ${distLabel}`;
+   L.circleMarker([h.lat,h.lon],{radius:isPrimary?9:7,color:'#fff',weight:2,fillColor:'#3ddc97',fillOpacity:1}).bindTooltip(esc(h.name)+info,{permanent:isPrimary,direction:'right'}).addTo(LG);
+   pts.push([h.lat,h.lon]);
+   if(isPrimary){focusPts.push([h.lat,h.lon]);if(routeValid)h.route.forEach(p=>focusPts.push(p))}})}
  s.devices.forEach(d=>{if(d.lat==null)return;
   L.circleMarker([d.lat,d.lon],{radius:10,color:'#fff',weight:2,fillColor:COL[d.status]||'#6b7785',fillOpacity:1}).bindTooltip(esc(d.id)+' '+d.status+(d.status=='ESCALATED'?' - RESCUE NEEDED':''),{permanent:true,direction:'top'}).addTo(LG);
-  pts.push([d.lat,d.lon])});
- const key=(B?B.alert_id:'-')+':'+(pts.length?1:0);
- if(pts.length&&key!==lastFit){LM.fitBounds(pts,{padding:[40,40],maxZoom:17});lastFit=key}}
+  pts.push([d.lat,d.lon]);focusPts.push([d.lat,d.lon])});
+ const fitTarget=focusPts.length?focusPts:pts;
+ const key=(B?B.alert_id:'-')+':'+(B?B.shelters.length:0)+':'+activeDevs.map(d=>d.id+'@'+d.lat.toFixed(2)+','+d.lon.toFixed(2)).join('|');
+ if(fitTarget.length&&key!==lastFit){LM.fitBounds(fitTarget,{padding:[40,40],maxZoom:17});lastFit=key}}
 function render(s){
  $('clock').textContent=new Date(s.now*1000).toLocaleTimeString();
  const A=s.alert,B=A&&A.body;
+ const dv=s.devices.find(d=>d.lat!=null&&(!B||hav(d.lat,d.lon,B.region.center[0],B.region.center[1])<=B.region.radius_km))||s.devices.find(d=>d.lat!=null);
  if(A){const bad=A.forged;
-  $('alertinfo').innerHTML=`<div class="big">${esc(B.headline)}</div><div>Status: <b>${A.status}</b> &nbsp; Signature: <b class="${bad?'bad':'ok'}">${bad?'INVALID (forged)':'valid'}</b></div><div class="t">Check-in every ${B.checkin_interval_s}s &middot; radius ${B.region.radius_km} km</div><div class="t" style="margin-top:6px">Shelters (${esc(B.shelter_source||'')}):<br>${B.shelters.map(h=>esc(h.name)+' - '+(h.distance_km??'?')+' km').join('<br>')}</div>`;
+  const shList=B.shelters.map(h=>{const dkm=dv?hav(dv.lat,dv.lon,h.lat,h.lon).toFixed(2):(h.distance_km??'?');return {h,dkm:+dkm,txt:esc(h.name)+' - '+dkm+' km'}}).sort((a,b)=>a.dkm-b.dkm).map(x=>x.txt).join('<br>');
+  $('alertinfo').innerHTML=`<div class="big">${esc(B.headline)}</div><div>Status: <b>${A.status}</b> &nbsp; Signature: <b class="${bad?'bad':'ok'}">${bad?'INVALID (forged)':'valid'}</b></div><div class="t">Check-in every ${B.checkin_interval_s}s &middot; radius ${B.region.radius_km} km</div><div class="t" style="margin-top:6px">Shelters (${esc(B.shelter_source||'')}${dv?' &middot; from '+esc(dv.id):''}):<br>${shList}</div>`;
   $('payload').textContent='sig: '+A.sig+'\n'+JSON.stringify(B,null,1)}
  else{$('alertinfo').textContent='No active alert';$('payload').textContent=''}
- const dv=s.devices.find(d=>d.lat!=null),c=B?B.region.center:(dv?[dv.lat,dv.lon]:[23.2599,77.4126]);
+ const c=B?B.region.center:(dv?[dv.lat,dv.lon]:[23.2599,77.4126]);
  const km=(la,lo)=>Math.hypot((lo-c[1])*111.32*Math.cos(c[0]*Math.PI/180),(la-c[0])*110.57);
  let maxD=B?0:5;if(B)B.shelters.forEach(h=>{maxD=Math.max(maxD,km(h.lat,h.lon))});s.devices.forEach(d=>{if(d.lat!=null)maxD=Math.max(maxD,km(d.lat,d.lon))});
  const R=Math.max(1,maxD*1.3),sc=170/R,cx=280,cy=210;
  const P=(la,lo)=>[cx+(lo-c[1])*111.32*Math.cos(c[0]*Math.PI/180)*sc,cy-(la-c[0])*110.57*sc];
  let m='';for(let i=1;i<10;i++){m+=`<line x1="${i*56}" y1="0" x2="${i*56}" y2="420" stroke="#141c24"/><line x1="0" y1="${i*42}" x2="560" y2="${i*42}" stroke="#141c24"/>`}
  if(B)m+=`<circle cx="${cx}" cy="${cy}" r="${B.region.radius_km*sc}" fill="rgba(255,59,59,.12)" stroke="#ff3b3b" stroke-dasharray="6 4"/>`;
+ if(B&&B.shelters.length){s.devices.forEach(d=>{if(d.lat==null)return;if(hav(d.lat,d.lon,B.region.center[0],B.region.center[1])>B.region.radius_km)return;let best=null,bestD=1e9;B.shelters.forEach(h=>{const x=hav(d.lat,d.lon,h.lat,h.lon);if(x<bestD){bestD=x;best=h}});if(best){const[x1,y1]=P(d.lat,d.lon),[x2,y2]=P(best.lat,best.lon);m+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#38bdf8" stroke-width="2" stroke-dasharray="5 4"/>`}})}
  if(B)B.shelters.forEach(h=>{const[x,y]=P(h.lat,h.lon);m+=`<rect x="${x-6}" y="${y-6}" width="12" height="12" fill="#3ddc97"/><text x="${x+10}" y="${y+4}" fill="#9aa7b2" font-size="10">${esc(h.name.replace(' (demo)',''))}</text>`});
  s.devices.forEach(d=>{if(d.lat==null)return;const[x,y]=P(d.lat,d.lon),col=COL[d.status]||'#6b7785';
   m+=`<circle cx="${x}" cy="${y}" r="9" fill="${col}" class="${d.status=='ESCALATED'?'pulse':''}"/><text x="${x+13}" y="${y-8}" fill="#f2ede4" font-size="11" font-weight="700">${esc(d.id)} ${d.status=='ESCALATED'?'(RESCUE NEEDED)':''}</text>`});

@@ -19,7 +19,17 @@ data class ActiveAlertState(
     val lastPollStatus: String = "Starting...",
     val mockLocationOverride: GeoPoint? = null,
     val mockBatteryOverride: Int? = null,
-)
+    val localShelters: List<Shelter> = emptyList(),
+) {
+    fun effectiveShelters(): List<Shelter> {
+        val alertShelters = alert?.shelters.orEmpty()
+        return if (localShelters.isEmpty()) {
+            alertShelters
+        } else {
+            LocalShelterResolver.mergeShelters(userLocation, localShelters, alertShelters)
+        }
+    }
+}
 
 object AlertStateHolder {
 
@@ -37,7 +47,22 @@ object AlertStateHolder {
             reservePowerActive = reservePowerActive,
             userLocation = location,
             batteryPct = batteryPct,
+            localShelters = emptyList(),
         )
+    }
+
+    fun updateAlertPayload(alert: AlertPayload) {
+        val current = _state.value
+        if (current.alert?.alertId == alert.alertId) {
+            _state.value = current.copy(alert = alert)
+        }
+    }
+
+    fun updateLocalShelters(alertId: String, shelters: List<Shelter>) {
+        val current = _state.value
+        if (current.alert?.alertId == alertId) {
+            _state.value = current.copy(localShelters = shelters)
+        }
     }
 
     fun updateLocation(location: GeoPoint, source: String = _state.value.locationSource) {
@@ -108,6 +133,7 @@ object AlertStateHolder {
         _state.value = _state.value.copy(
             alert = null,
             reservePowerActive = false,
+            localShelters = emptyList(),
             clearNonce = _state.value.clearNonce + 1L,
         )
     }

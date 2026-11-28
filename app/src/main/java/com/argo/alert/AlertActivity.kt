@@ -112,9 +112,11 @@ class AlertActivity : ComponentActivity() {
             }
 
             val alert = activeState.alert ?: return@setContent
+            val effectiveShelters = activeState.effectiveShelters()
 
             AlertFlowRoot(
                 alert = alert,
+                shelters = effectiveShelters,
                 userLocation = activeState.userLocation,
                 reservePowerActive = activeState.reservePowerActive,
                 onEmergencyDial = { openEmergencyDialer() },
@@ -275,6 +277,7 @@ class AlertActivity : ComponentActivity() {
 @Composable
 private fun AlertFlowRoot(
     alert: AlertPayload,
+    shelters: List<Shelter>,
     userLocation: GeoPoint,
     reservePowerActive: Boolean,
     onEmergencyDial: () -> Unit,
@@ -295,7 +298,7 @@ private fun AlertFlowRoot(
                 val nearest = CryptoAndGeo.findNearestShelter(
                     userLocation.lat,
                     userLocation.lon,
-                    alert.shelters,
+                    shelters,
                 )
                 onSliderConfirmed(
                     alert.checkinIntervalS,
@@ -307,6 +310,7 @@ private fun AlertFlowRoot(
     } else {
         EvacuationGuidanceScreen(
             alert = alert,
+            shelters = shelters,
             userLocation = userLocation,
             reservePowerActive = reservePowerActive,
             onCheckIn = onCheckIn,
@@ -520,6 +524,7 @@ private fun SlideToEvacuateControl(
 @Composable
 private fun EvacuationGuidanceScreen(
     alert: AlertPayload,
+    shelters: List<Shelter>,
     userLocation: GeoPoint,
     reservePowerActive: Boolean,
     onCheckIn: (intervalS: Int) -> Unit,
@@ -563,7 +568,7 @@ private fun EvacuationGuidanceScreen(
             ) {
                 StreetEvacuationMap(
                     userLocation = userLocation,
-                    shelters = alert.shelters,
+                    shelters = shelters,
                     region = alert.region,
                     modifier = Modifier.fillMaxSize(),
                 )

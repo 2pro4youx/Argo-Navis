@@ -1,0 +1,11 @@
+{
+  "name": "argo-navis",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "npm --prefix \"Web-Build/injector-prototype (2)\" run dev",
+    "build": "npm --prefix \"Web-Build/injector-prototype (2)\" run build",
+    "lint": "npm --prefix \"Web-Build/injector-prototype (2)\" run lint",
+    "preview": "npm --prefix \"Web-Build/injector-prototype (2)\" run preview"
+  }
+}

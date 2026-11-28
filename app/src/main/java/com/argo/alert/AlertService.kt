@@ -204,6 +204,9 @@ class AlertService : Service() {
             val source = telemetry.locationSource()
             AlertStateHolder.updateLocation(location, source)
             AlertStateHolder.updateBattery(batteryPct)
+            if (AlertStateHolder.state.value.alert != null) {
+                LocalShelterResolver.resolveIfNeeded(AlertStateHolder.state.value)
+            }
 
             val responses = EventClient.pollAll(location.lat, location.lon, batteryPct, source)
             for (response in responses) {
@@ -234,13 +237,20 @@ class AlertService : Service() {
         if (seenPayloads.contains(rawPayload)) return
         seenPayloads.add(rawPayload)
 
+        val candidateAlertId = response.alertId ?: runCatching {
+            org.json.JSONObject(rawPayload).optString("alert_id", "")
+        }.getOrNull()
+        val isSilentRefresh = candidateAlertId != null && candidateAlertId == activeAlertId
+
         // Step 1: ALERT_RECEIVED
-        EventClient.postEventSync(
-            event = "ALERT_RECEIVED",
-            detail = "bytes=${rawPayload.length}",
-            lat = location.lat,
-            lon = location.lon,
-        )
+        if (!isSilentRefresh) {
+            EventClient.postEventSync(
+                event = "ALERT_RECEIVED",
+                detail = "bytes=${rawPayload.length}",
+                lat = location.lat,
+                lon = location.lon,
+            )
+        }
 
         // Step 2: Verify HMAC-SHA256 (constant-time hex compare)
         val sigOk = CryptoAndGeo.verifyHmacSha256(
@@ -257,12 +267,14 @@ class AlertService : Service() {
             )
             return
         }
-        EventClient.postEventSync(
-            event = "SIGNATURE_OK",
-            detail = "HMAC-SHA256 verified",
-            lat = location.lat,
-            lon = location.lon,
-        )
+        if (!isSilentRefresh) {
+            EventClient.postEventSync(
+                event = "SIGNATURE_OK",
+                detail = "HMAC-SHA256 verified",
+                lat = location.lat,
+                lon = location.lon,
+            )
+        }
 
         val alert = try {
             AlertJsonParser.parseAlertPayload(rawPayload)
@@ -282,17 +294,24 @@ class AlertService : Service() {
             alert.region.center.lon,
         )
         if (distanceKm > alert.region.radiusKm) {
-            EventClient.postEventSync(
-                event = "OUT_OF_REGION",
-                detail = String.format(
-                    Locale.US,
-                    "distance_km=%.2f radius_km=%.2f",
-                    distanceKm,
-                    alert.region.radiusKm,
-                ),
-                lat = location.lat,
-                lon = location.lon,
-            )
+            if (!isSilentRefresh) {
+                EventClient.postEventSync(
+                    event = "OUT_OF_REGION",
+                    detail = String.format(
+                        Locale.US,
+                        "distance_km=%.2f radius_km=%.2f",
+                        distanceKm,
+                        alert.region.radiusKm,
+                    ),
+                    lat = location.lat,
+                    lon = location.lon,
+                )
+            }
+            return
+        }
+        if (isSilentRefresh) {
+            AlertStateHolder.updateAlertPayload(alert)
+            LocalShelterResolver.resolveIfNeeded(AlertStateHolder.state.value)
             return
         }
         EventClient.postEventSync(
@@ -326,6 +345,7 @@ class AlertService : Service() {
             location = location,
             batteryPct = batteryPct,
         )
+        LocalShelterResolver.resolveIfNeeded(AlertStateHolder.state.value)
         acquireTemporaryWakeLock()
         SirenController.startFullAlarm(applicationContext)
         launchEmergencyUi(alert)

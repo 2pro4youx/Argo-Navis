@@ -88,15 +88,16 @@ fun StreetEvacuationMap(
         modifier = modifier.clipToBounds(),
         factory = { mapView },
         update = { mv ->
+            val nearest = nearestPair?.first
+            val straightKm = nearestPair?.second
+            val hasValidRouteFromUser = LocalShelterResolver.isRouteValidForUser(userLocation, nearest)
             val currentRenderKey =
-                "${userLocation.lat},${userLocation.lon}|${region.center.lat},${region.center.lon},${region.radiusKm}|${shelters.size}|${nearestPair?.first?.name}"
+                "${userLocation.lat},${userLocation.lon}|${region.center.lat},${region.center.lon},${region.radiusKm}|${shelters.size}|${nearest?.name}|${nearest?.route?.size ?: 0}|$hasValidRouteFromUser"
             if (currentRenderKey == mapState.renderKey) return@AndroidView
             mapState.renderKey = currentRenderKey
 
             mv.overlays.clear()
             val user = OsmPoint(userLocation.lat, userLocation.lon)
-            val nearest = nearestPair?.first
-            val straightKm = nearestPair?.second
 
             // Alert area
             mv.overlays.add(
@@ -111,9 +112,9 @@ fun StreetEvacuationMap(
                 },
             )
 
-            // Route to the nearest shelter (walking route if the alert carries one, else a straight line)
+            // Route to the nearest shelter (only use precomputed walking route if it starts near user)
             val routePoints: List<OsmPoint> = when {
-                nearest != null && nearest.route.size >= 2 -> nearest.route.map { OsmPoint(it.lat, it.lon) }
+                hasValidRouteFromUser && nearest != null -> nearest.route.map { OsmPoint(it.lat, it.lon) }
                 nearest != null -> listOf(user, OsmPoint(nearest.lat, nearest.lon))
                 else -> emptyList()
             }
@@ -124,7 +125,7 @@ fun StreetEvacuationMap(
                         outlinePaint.color = AColor.rgb(30, 144, 255)
                         outlinePaint.strokeWidth = 12f
                         outlinePaint.strokeCap = Paint.Cap.ROUND
-                        if (nearest != null && nearest.route.size < 2) {
+                        if (!hasValidRouteFromUser) {
                             outlinePaint.pathEffect = DashPathEffect(floatArrayOf(24f, 16f), 0f)
                         }
                     },
@@ -134,6 +135,8 @@ fun StreetEvacuationMap(
             // Shelters
             shelters.forEach { sh ->
                 val isNearest = sh === nearest
+                val shRouteValid = LocalShelterResolver.isRouteValidForUser(userLocation, sh)
+                val distKm = CryptoAndGeo.haversineKm(userLocation.lat, userLocation.lon, sh.lat, sh.lon)
                 mv.overlays.add(
                     Marker(mv).apply {
                         position = OsmPoint(sh.lat, sh.lon)
@@ -141,11 +144,12 @@ fun StreetEvacuationMap(
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                         title = if (isNearest) "NEAREST: ${sh.name}" else sh.name
                         snippet = when {
-                            sh.routeKm != null && sh.routeMin != null ->
+                            shRouteValid && sh.routeKm != null && sh.routeMin != null ->
                                 String.format(Locale.US, "%.1f km walk, about %d min", sh.routeKm, sh.routeMin)
                             isNearest && straightKm != null ->
                                 String.format(Locale.US, "%.1f km straight line", straightKm)
-                            else -> null
+                            else ->
+                                String.format(Locale.US, "%.1f km away", distKm)
                         }
                         if (isNearest) showInfoWindow()
                     },
@@ -162,9 +166,9 @@ fun StreetEvacuationMap(
                 },
             )
 
-            // Fit the view to you + nearest shelter + route, but only when the target changes,
-            // so the person can still pan and zoom.
-            val key = "${nearest?.name}:${nearest?.route?.size}"
+            // Fit the view to you + nearest shelter + route, re-fitting when target, route, or 1km location bucket changes
+            val userBucket = String.format(Locale.US, "%.2f,%.2f", userLocation.lat, userLocation.lon)
+            val key = "$userBucket:${nearest?.name}:$hasValidRouteFromUser:${nearest?.route?.size ?: 0}"
             if (key != mapState.fitKey) {
                 mapState.fitKey = key
                 val all = buildList {
