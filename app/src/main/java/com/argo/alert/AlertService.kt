@@ -22,10 +22,11 @@ class AlertService : Service() {
 
     companion object {
         private const val TAG = "ArgoAlertService"
-        private const val MONITOR_CHANNEL_ID = "argo_monitor"
+        private const val LEGACY_MONITOR_CHANNEL_ID = "argo_monitor"
+        private const val MONITOR_CHANNEL_ID = "argo_monitor_hidden"
         private const val ALARM_CHANNEL_ID = "argo_alarm"
         private const val MONITOR_NOTIFICATION_ID = 1001
-        private const val ALARM_NOTIFICATION_ID = 1002
+        const val ALARM_NOTIFICATION_ID = 1002
         private const val POLL_INTERVAL_SECONDS = 2L
 
         const val ACTION_START = "com.argo.alert.ACTION_START"
@@ -48,6 +49,11 @@ class AlertService : Service() {
         fun pollNow(context: Context) = sendAction(context, ACTION_POLL_NOW)
         fun refreshTelemetry(context: Context) = sendAction(context, ACTION_REFRESH_TELEMETRY)
         fun restart(context: Context) = sendAction(context, ACTION_RESTART)
+
+        fun cancelAlarmNotification(context: Context) {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.cancel(ALARM_NOTIFICATION_ID)
+        }
     }
 
     private lateinit var telemetry: DeviceTelemetry
@@ -55,6 +61,7 @@ class AlertService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
 
     private val seenPayloads = mutableSetOf<String>()
+    private val clearedAlertIds = mutableSetOf<String>()
     private var activeAlertId: String? = null
 
     override fun onCreate() {
@@ -102,14 +109,18 @@ class AlertService : Service() {
     private fun createNotificationChannels() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.deleteNotificationChannel(LEGACY_MONITOR_CHANNEL_ID)
 
         val monitorChannel = NotificationChannel(
             MONITOR_CHANNEL_ID,
             getString(R.string.monitor_channel_name),
-            NotificationManager.IMPORTANCE_LOW,
+            NotificationManager.IMPORTANCE_MIN,
         ).apply {
             description = getString(R.string.monitor_channel_description)
             setShowBadge(false)
+            setSound(null, null)
+            enableVibration(false)
+            lockscreenVisibility = Notification.VISIBILITY_SECRET
         }
         nm.createNotificationChannel(monitorChannel)
 
@@ -133,7 +144,10 @@ class AlertService : Service() {
             .setContentTitle(getString(R.string.app_name))
             .setContentText("OEM emergency layer active")
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setSilent(true)
+            .setShowWhen(false)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
 
@@ -198,6 +212,14 @@ class AlertService : Service() {
                     "CLEARED" -> handleClearedPoll(response, location)
                 }
             }
+            val currentActive = activeAlertId ?: AlertStateHolder.state.value.alert?.alertId
+            if (currentActive != null &&
+                responses.isNotEmpty() &&
+                responses.none { it.status == "ACTIVE" } &&
+                responses.any { it.status == "NONE" }
+            ) {
+                clearActiveAlert(currentActive, location)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error in poll loop: ${e.message}", e)
         }
@@ -246,6 +268,9 @@ class AlertService : Service() {
             AlertJsonParser.parseAlertPayload(rawPayload)
         } catch (e: Exception) {
             Log.e(TAG, "Invalid alert JSON: ${e.message}", e)
+            return
+        }
+        if (clearedAlertIds.contains(alert.alertId)) {
             return
         }
 
@@ -315,7 +340,7 @@ class AlertService : Service() {
 
     private fun handleClearedPoll(response: PollResponse, location: GeoPoint) {
         // Only process CLEARED once while an alert is actually active
-        val currentActive = activeAlertId ?: return
+        val currentActive = activeAlertId ?: AlertStateHolder.state.value.alert?.alertId ?: return
         val targetAlertId = response.alertId ?: currentActive
         val expectedMessage = "$targetAlertId|CLEARED"
         val validClear = CryptoAndGeo.verifyHmacSha256(
@@ -328,7 +353,13 @@ class AlertService : Service() {
             return
         }
 
+        clearActiveAlert(targetAlertId, location)
+    }
+
+    private fun clearActiveAlert(targetAlertId: String, location: GeoPoint) {
         // Step 6: Stop siren, stop lock task / close activity, cancel full-screen notification, post ALL_CLEAR
+        clearedAlertIds.add(targetAlertId)
+        activeAlertId?.let { clearedAlertIds.add(it) }
         SirenController.stopAll()
         AlertStateHolder.clearAlert()
         activeAlertId = null
@@ -353,33 +384,32 @@ class AlertService : Service() {
             )
         }
 
-        // Full-screen-intent notification fallback (required for background launches on Android 10+)
-        val fullScreenPendingIntent = PendingIntent.getActivity(
-            this,
-            ALARM_NOTIFICATION_ID,
-            activityIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-
-        val alarmNotification = NotificationCompat.Builder(this, ALARM_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_dialog_alert)
-            .setContentTitle("${alert.type.uppercase()} — ${alert.severity.uppercase()}")
-            .setContentText(alert.headline)
-            .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setCategory(NotificationCompat.CATEGORY_ALARM)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setOngoing(true)
-            .setAutoCancel(false)
-            .setFullScreenIntent(fullScreenPendingIntent, true)
-            .build()
-
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(ALARM_NOTIFICATION_ID, alarmNotification)
-
         runCatching {
             startActivity(activityIntent)
         }.onFailure { err ->
             Log.w(TAG, "Direct startActivity blocked; relying on fullScreenIntent: ${err.message}")
+            // Full-screen-intent notification fallback (required for background launches on Android 10+)
+            val fullScreenPendingIntent = PendingIntent.getActivity(
+                this,
+                ALARM_NOTIFICATION_ID,
+                activityIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+
+            val alarmNotification = NotificationCompat.Builder(this, ALARM_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setContentTitle("${alert.type.uppercase()} — ${alert.severity.uppercase()}")
+                .setContentText(alert.headline)
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setOngoing(true)
+                .setAutoCancel(false)
+                .setFullScreenIntent(fullScreenPendingIntent, true)
+                .build()
+
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(ALARM_NOTIFICATION_ID, alarmNotification)
         }
     }
 

@@ -291,7 +291,17 @@ object EventClient {
                 if (transportMode == TransportMode.DUAL && isFirebaseRtdb(baseUrl)) {
                     AlertStateHolder.updatePollStatus("Connected (Firebase · $deviceId)")
                 }
-                if (body.isBlank() || body == "null") null else AlertJsonParser.parsePollResponse(body)
+                if (body.isBlank() || body == "null") {
+                    PollResponse(
+                        status = "NONE",
+                        payloadRaw = null,
+                        signature = null,
+                        alertId = null,
+                        clearSig = null,
+                    )
+                } else {
+                    AlertJsonParser.parsePollResponse(body)
+                }
             } else {
                 Log.w(TAG, "Firebase poll returned HTTP $code")
                 AlertStateHolder.updateFirebaseStatus("HTTP $code")

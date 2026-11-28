@@ -47,6 +47,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -67,7 +68,9 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
@@ -85,9 +88,18 @@ class AlertActivity : ComponentActivity() {
         disableBackNavigation()
 
         initialClearNonce = AlertStateHolder.state.value.clearNonce
+        AlertService.cancelAlarmNotification(this)
         AdminReceiver.ensureLockTaskWhitelisted(this)
         enterLockTaskMode()
         SirenController.startFullAlarm(this)
+
+        lifecycleScope.launch {
+            AlertStateHolder.state.collect { activeState ->
+                if (activeState.clearNonce > initialClearNonce || activeState.alert == null) {
+                    teardownAndFinish()
+                }
+            }
+        }
 
         setContent {
             val activeState by AlertStateHolder.state.collectAsState()
@@ -160,6 +172,14 @@ class AlertActivity : ComponentActivity() {
                     SirenController.resumeQuietSiren(this)
                 },
             )
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val activeState = AlertStateHolder.state.value
+        if (activeState.clearNonce > initialClearNonce || activeState.alert == null) {
+            teardownAndFinish()
         }
     }
 
@@ -240,6 +260,7 @@ class AlertActivity : ComponentActivity() {
     }
 
     private fun teardownAndFinish() {
+        if (isFinishing || isDestroyed) return
         SirenController.stopAll()
         runCatching {
             val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -247,7 +268,7 @@ class AlertActivity : ComponentActivity() {
                 stopLockTask()
             }
         }
-        finish()
+        finishAndRemoveTask()
     }
 }
 
@@ -536,7 +557,8 @@ private fun EvacuationGuidanceScreen(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .fillMaxHeight(0.60f)
+                    .weight(0.60f)
+                    .clipToBounds()
                     .background(Color(0xFF0D1117)),
             ) {
                 StreetEvacuationMap(
@@ -559,7 +581,9 @@ private fun EvacuationGuidanceScreen(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f)
+                    .weight(0.40f)
+                    .clipToBounds()
+                    .background(Color(0xFF090B0E))
                     .verticalScroll(rememberScrollState())
                     .padding(start = 18.dp, end = 112.dp, top = 14.dp, bottom = 20.dp),
             ) {

@@ -35,5 +35,42 @@
    "kind": "Place of Worship",
    "distance_km": 1.84
   }
+ ],
+ "23.074,76.852": [
+  {
+   "name": "Vellore Institute of Technology -  (University)",
+   "lat": 23.07551,
+   "lon": 76.84978,
+   "kind": "University",
+   "distance_km": 0.31
+  },
+  {
+   "name": "VITB Multi-purpose Hall (College)",
+   "lat": 23.07621,
+   "lon": 76.84965,
+   "kind": "College",
+   "distance_km": 0.36
+  },
+  {
+   "name": "VITB Academic Block 1 (College)",
+   "lat": 23.07764,
+   "lon": 76.85152,
+   "kind": "College",
+   "distance_km": 0.38
+  },
+  {
+   "name": "Architecture Building (University)",
+   "lat": 23.07801,
+   "lon": 76.8502,
+   "kind": "University",
+   "distance_km": 0.47
+  },
+  {
+   "name": "Radha Swami Satsang Vyas (Place of Worship)",
+   "lat": 23.08848,
+   "lon": 76.85371,
+   "kind": "Place of Worship",
+   "distance_km": 1.58
+  }
  ]
 }

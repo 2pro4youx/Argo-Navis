@@ -68,7 +68,7 @@ class MainActivity : ComponentActivity() {
         refreshStatus()
         AlertService.refreshTelemetry(applicationContext)
         serviceStarted = true
-        if (hasLocationPermission && hasNotificationPermission) {
+        if (hasLocationPermission) {
             showToast("Permissions granted")
         } else {
             showToast("Some permissions denied — tap button again for App Settings")
@@ -218,12 +218,6 @@ class MainActivity : ComponentActivity() {
             ) {
                 add(Manifest.permission.ACCESS_FINE_LOCATION)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                add(Manifest.permission.POST_NOTIFICATIONS)
-            }
         }
         if (needed.isEmpty()) {
             AlertService.refreshTelemetry(applicationContext)
@@ -237,7 +231,7 @@ class MainActivity : ComponentActivity() {
             requestedPermissionsBefore = true
             permissionLauncher.launch(needed.toTypedArray())
         } else {
-            openAppDetailsSettings("Enable Location & Notifications in App Settings")
+            openAppDetailsSettings("Enable Location in App Settings")
         }
     }
 
@@ -589,7 +583,7 @@ private fun BootstrapScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        if (!hasLocationPermission || !hasNotificationPermission) {
+        if (!hasLocationPermission) {
             Button(
                 onClick = onRequestPermissions,
                 modifier = Modifier
@@ -599,7 +593,7 @@ private fun BootstrapScreen(
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
             ) {
                 Text(
-                    "Grant GPS & Notification Permissions",
+                    "Grant GPS Permission",
                     color = Color.White,
                     fontWeight = FontWeight.Bold,
                 )
@@ -618,24 +612,6 @@ private fun BootstrapScreen(
             ) {
                 Text(
                     "Allow Display Over Other Apps (Required)",
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-        }
-
-        if (!canUseFullScreenIntent) {
-            Button(
-                onClick = onOpenFullScreenIntentSettings,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp),
-                shape = RoundedCornerShape(10.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB45309)),
-            ) {
-                Text(
-                    "Allow Full-Screen Notifications (Required)",
                     color = Color.White,
                     fontWeight = FontWeight.Bold,
                 )

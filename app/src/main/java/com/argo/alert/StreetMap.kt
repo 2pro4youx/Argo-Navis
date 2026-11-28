@@ -8,6 +8,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import org.osmdroid.config.Configuration
@@ -55,6 +56,9 @@ fun StreetEvacuationMap(
             }
         }
         MapView(context).apply {
+            clipChildren = true
+            clipToPadding = true
+            clipToOutline = true
             setTileSource(TileSourceFactory.MAPNIK)
             setMultiTouchControls(true)
             minZoomLevel = 4.0
@@ -81,7 +85,7 @@ fun StreetEvacuationMap(
         }
 
     AndroidView(
-        modifier = modifier,
+        modifier = modifier.clipToBounds(),
         factory = { mapView },
         update = { mv ->
             val currentRenderKey =
